@@ -1,4 +1,5 @@
 <!-- markdownlint-disable MD001 MD041 -->
+> Note: This is a custom fork integrating [FlashMLA](https://github.com/Jayden-Xu/FlashMLA). It implements a custom Attention Backend for DeepSeek models using Triton.
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
