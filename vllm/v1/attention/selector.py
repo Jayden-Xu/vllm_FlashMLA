@@ -97,7 +97,7 @@ def _cached_get_attn_backend(
         logger.info(f"⚡️ [Selector] Hijacking MLA backend!")
 
         return resolve_obj_by_qualname(
-            "vllm.v1.attention.backends.flash_mla.FlashMLAAttentionBackend"
+            "vllm.v1.attention.backends.flash_mla.FlashMLABackend"
         )
 
 
