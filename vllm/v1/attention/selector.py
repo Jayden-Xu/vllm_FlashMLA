@@ -91,6 +91,16 @@ def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,
 ) -> type[AttentionBackend]:
+    
+    # all MLA models must use FlashMLA backend
+    if attn_selector_config.use_mla:
+        logger.info(f"⚡️ [Selector] Hijacking MLA backend!")
+
+        return resolve_obj_by_qualname(
+            "vllm.v1.attention.backends.flash_mla.FlashMLAAttentionBackend"
+        )
+
+
     from vllm.platforms import current_platform
 
     attention_cls = current_platform.get_attn_backend_cls(
