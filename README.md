@@ -1,5 +1,5 @@
 <!-- markdownlint-disable MD001 MD041 -->
-# vLLM_FlashMLA: a custom fork integrating [FlashMLA](https://github.com/Jayden-Xu/FlashMLA).
+# vLLM_FlashMLA: A custom fork integrating [FlashMLA](https://github.com/Jayden-Xu/FlashMLA).
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
