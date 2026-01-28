@@ -10,83 +10,97 @@ def flash_mla_prefill_kernel(
     Q_ptr, KV_ptr, cu_seqlens_ptr, Output_ptr,
     stride_q_n, stride_q_h, stride_q_d,
     stride_kv_n, stride_kv_h, stride_kv_d,
+    stride_o_n, stride_o_h, stride_o_d,
     sm_scale,
     D_LATENT: tl.constexpr, D_ROPE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
+    # Grid: (M_blocks, Batch_Size, Heads)
     pid_m = tl.program_id(0); pid_b = tl.program_id(1); pid_h = tl.program_id(2)
     
-    # 512 + 64 = 576
     HEAD_DIM: tl.constexpr = D_LATENT + D_ROPE
-    # Triton arange 必须是 2 的幂，所以我们用 1024，然后 mask 掉多余的
     PADDED_HEAD_DIM: tl.constexpr = 1024 
 
+    # 1. 读取当前 Batch 的 Sequence 范围
     cu_seqlens_start = tl.load(cu_seqlens_ptr + pid_b)
     cu_seqlens_end = tl.load(cu_seqlens_ptr + pid_b + 1)
     seq_len = cu_seqlens_end - cu_seqlens_start
+    
+    # 越界检查
     if pid_m * BLOCK_M >= seq_len: return
     
+    # 2. 准备 Q 的索引
     start_m = pid_m * BLOCK_M
     offs_m = start_m + tl.arange(0, BLOCK_M)
     q_token_idx = cu_seqlens_start + offs_m
     mask_m = offs_m < seq_len
     
-    # ----------------------------------------------------------------
-    # 修正：使用 PADDED_HEAD_DIM 并 Mask
-    # ----------------------------------------------------------------
     offs_d = tl.arange(0, PADDED_HEAD_DIM)
-    mask_d = offs_d < HEAD_DIM # 只保留前 576 个元素
+    mask_d = offs_d < HEAD_DIM
     
+    # 3. 加载 Q
     q_ptrs = Q_ptr + q_token_idx[:, None] * stride_q_n + pid_h * stride_q_h + offs_d[None, :] * stride_q_d
-    # Mask 需要同时考虑 Sequence 边界 (M) 和 维度边界 (D)
     q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-    q = (q * sm_scale).to(Q_ptr.dtype.element_ty)
+    # 类型转换: bf16 -> fp32 (scale) -> fp16 (for dot)
+    q = (q * sm_scale).to(tl.float16) 
     
+    # 4. 初始化 Accumulator
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) + 1.0
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) # Init to 0.0 is safer standard
     acc = tl.zeros([BLOCK_M, D_LATENT], dtype=tl.float32)
     
+    # 5. 循环 KV Blocks
+    # 因果 Mask: 只需要遍历到当前的 M Block 即可 (limit_n)
+    # limit_n 是当前 Q block 结束的位置，或者是 seq_len 的尽头
     limit_n = tl.minimum((pid_m + 1) * BLOCK_M, seq_len)
-    offs_d_latent = tl.arange(0, D_LATENT)
     
+    offs_d_latent = tl.arange(0, D_LATENT) # Hoisted out of loop
+
     for start_n in range(0, limit_n, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         kv_token_idx = cu_seqlens_start + offs_n
         mask_n = offs_n < seq_len
         
-        # Load K (576 -> 1024 Padded)
-        # K 转置后: [1024, BLOCK_N]
+        # Load K
         k_ptrs = KV_ptr + kv_token_idx[None, :] * stride_kv_n + offs_d[:, None] * stride_kv_d
         k = tl.load(k_ptrs, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
         
-        # Load V (Only Latent 512, Power of 2, OK)
-
-        v_ptrs = KV_ptr + kv_token_idx[:, None] * stride_kv_n + offs_d_latent[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        # Dot Product (fp16 accumulator, then cast to fp32)
+        # q: [M, D], k: [D, N] -> [M, N]
+        qk = tl.dot(q, k.to(tl.float16))
         
-        # Dot Product (q: [M, 1024], k: [1024, N])
-        # 多出来的部分是 0 * 0 = 0，不影响结果
-        qk = tl.dot(q, k)
-        
+        # Causal Masking
+        # 如果当前 KV Block 与 Q Block 重叠 (对角线 Block)，需要 Mask
         if start_n + BLOCK_N > start_m:
             mask_causal = offs_m[:, None] >= offs_n[None, :]
             qk = tl.where(mask_causal, qk, float("-inf"))
-            qk = tl.where(mask_n[None, :], qk, float("-inf"))
-        else:
-            qk = tl.where(mask_n[None, :], qk, float("-inf"))
+        
+        # Boundary Masking (Padding)
+        qk = tl.where(mask_n[None, :], qk, float("-inf"))
             
+        # Softmax Update
         m_curr = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_curr)
+        
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(qk - m_new[:, None])
+        
+        # Load V
+        v_ptrs = KV_ptr + kv_token_idx[:, None] * stride_kv_n + offs_d_latent[None, :] * stride_kv_d
+        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        
         acc = acc * alpha[:, None]
+        # p: [M, N], v: [N, D] -> [M, D]
         acc = tl.dot(p.to(tl.float16), v.to(tl.float16), acc)
+        
         l_curr = tl.sum(p, 1)
         l_i = l_i * alpha + l_curr
         m_i = m_new
         
+    # 6. Epilogue
     acc = acc / l_i[:, None]
-    out_ptrs = Output_ptr + q_token_idx[:, None] * stride_q_n + pid_h * stride_q_h + offs_d_latent[None, :] * stride_q_d
+    
+    out_ptrs = Output_ptr + q_token_idx[:, None] * stride_o_n + pid_h * stride_o_h + offs_d_latent[None, :] * stride_o_d
     tl.store(out_ptrs, acc.to(Output_ptr.dtype.element_ty), mask=mask_m[:, None])
 
 
