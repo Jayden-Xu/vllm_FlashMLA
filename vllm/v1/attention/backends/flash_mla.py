@@ -137,6 +137,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             q_raw, k_raw, cu_seqlens, output,
             q_raw.stride(0), q_raw.stride(1), q_raw.stride(2),
             k_raw.stride(0), k_raw.stride(1), k_raw.stride(2),
+            output.stride(0), output.stride(1), output.stride(2),
             self.scale,
             D_LATENT=self.kv_lora_rank, D_ROPE=self.qk_rope_head_dim,
             BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N
