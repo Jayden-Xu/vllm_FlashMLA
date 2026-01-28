@@ -5,7 +5,7 @@ from functools import cache
 from typing import NamedTuple, cast, get_args
 
 import torch
-
+import os
 from vllm.config.cache import CacheDType
 from vllm.logger import init_logger
 from vllm.utils.import_utils import resolve_obj_by_qualname
@@ -91,14 +91,15 @@ def _cached_get_attn_backend(
     backend,
     attn_selector_config: AttentionSelectorConfig,
 ) -> type[AttentionBackend]:
-    
-    # all MLA models must use FlashMLA backend
-    if attn_selector_config.use_mla:
-        logger.info(f"⚡️ [Selector] Hijacking MLA backend!")
 
+    if attn_selector_config.use_mla and os.getenv("DISABLE_FLASH_MLA") != "1":
+        logger.info(f"[Selector] Hijacking MLA backend!")
         return resolve_obj_by_qualname(
             "vllm.v1.attention.backends.flash_mla.FlashMLABackend"
         )
+    
+    if attn_selector_config.use_mla and os.getenv("DISABLE_FLASH_MLA") == "1":
+        logger.info(f"[Selector] FlashMLA Hijack Skipped (DISABLE_FLASH_MLA=1). Using vLLM default.")
 
 
     from vllm.platforms import current_platform

@@ -1,9 +1,6 @@
 import triton
 import triton.language as tl
 
-# ==========================
-# Autotune 配置空间
-# ==========================
 
 def get_prefill_configs():
     return [
@@ -33,9 +30,6 @@ def get_decode_stage2_configs():
         triton.Config({}, num_warps=8),
     ]
 
-# ==========================
-# Prefill Kernel
-# ==========================
 
 @triton.autotune(configs=get_prefill_configs(), key=['D_LATENT', 'D_ROPE'])
 @triton.jit
@@ -59,7 +53,6 @@ def flash_mla_prefill_kernel(
     offs_d_latent = tl.arange(0, D_LATENT)
     offs_d_rope = tl.arange(0, D_ROPE)
     
-    # 加载 Q (Nope & PE)
     q_n_ptrs = Q_nope_ptr + (start_q + offs_m[:, None]) * stride_qnn + pid_h * stride_qnh + offs_d_latent[None, :] * stride_qnd
     q_p_ptrs = Q_pe_ptr + (start_q + offs_m[:, None]) * stride_qpn + pid_h * stride_qph + offs_d_rope[None, :] * stride_qpd
     
@@ -75,7 +68,6 @@ def flash_mla_prefill_kernel(
     for start_n in range(0, limit_n, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         
-        # 加载 KV
         kv_base = KV_ptr + (start_q + offs_n[None, :]) * stride_kvn
         kn_ptrs = kv_base + offs_d_latent[:, None] * stride_kvd
         kp_ptrs = kv_base + (D_LATENT + offs_d_rope[:, None]) * stride_kvd
@@ -83,14 +75,13 @@ def flash_mla_prefill_kernel(
         kn = tl.load(kn_ptrs, mask=offs_n[None, :] < seq_len, other=0.0)
         kp = tl.load(kp_ptrs, mask=offs_n[None, :] < seq_len, other=0.0)
         
-        # 分治点积
         qk = (tl.dot(qn.to(tl.float16), kn.to(tl.float16)) + 
               tl.dot(qp.to(tl.float16), kp.to(tl.float16))) * sm_scale
 
         if start_n + BLOCK_N > pid_m * BLOCK_M:
             qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
         
-        # Online Softmax
+        # online Softmax
         m_curr = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_curr)
         p = tl.exp(qk - m_new[:, None])
@@ -105,9 +96,6 @@ def flash_mla_prefill_kernel(
     out_ptrs = Output_ptr + (start_q + offs_m[:, None]) * stride_on + pid_h * stride_oh + offs_d_latent[None, :] * stride_od
     tl.store(out_ptrs, acc.to(Output_ptr.dtype.element_ty), mask=offs_m[:, None] < seq_len)
 
-# ==========================
-# Decode Kernels (Stage 1 & 2)
-# ==========================
 
 @triton.autotune(configs=get_decode_stage1_configs(), key=['D_LATENT', 'D_ROPE', 'KV_BLOCK_SIZE'])
 @triton.jit
@@ -168,6 +156,7 @@ def flash_mla_decode_stage_1_kernel(
     if l_i > 0:
         tl.store(Mid_O_ptr + pid_b * stride_mid_ob + pid_h * stride_mid_oh + pid_s * stride_mid_os + offs_d_latent * stride_mid_od, acc / l_i)
         tl.store(Mid_LSE_ptr + pid_b * stride_mid_lb + pid_h * stride_mid_lh + pid_s * stride_mid_ls, m_i + tl.log(l_i))
+
 
 @triton.autotune(configs=get_decode_stage2_configs(), key=['D_LATENT', 'NUM_SPLITS'])
 @triton.jit

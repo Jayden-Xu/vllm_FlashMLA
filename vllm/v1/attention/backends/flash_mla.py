@@ -22,7 +22,6 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
-# 导入算子
 try:
     from vllm.v1.attention.ops.triton_flash_mla import (
         flash_mla_prefill_kernel,
@@ -70,7 +69,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         logger.info(f"⚡ [FlashMLA] Backend Loaded (Latent={self.kv_lora_rank}, RoPE={self.qk_rope_head_dim})")
 
     def _run_prefill_triton_impl(self, q, k, v, attn_metadata, kv_cache=None, **kwargs):
-        q_nope, q_pe = q if isinstance(q, tuple) else (q[..., :512], q[..., 512:])
+        q_nope, q_pe = q if isinstance(q, tuple) else (q[..., :self.kv_lora_rank], q[..., self.kv_lora_rank:])
         k_final = torch.cat([v, k], dim=-1)
 
         if kv_cache is not None and attn_metadata.slot_mapping is not None:
@@ -89,7 +88,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 *q_nope.stride(), *q_pe.stride(), 
                 k_final.stride(0), k_final.stride(2), 
                 *output.stride(),
-                self.scale, D_LATENT=512, D_ROPE=64
+                self.scale, D_LATENT=self.kv_lora_rank, D_ROPE=self.qk_rope_head_dim
             )
         return output
 
@@ -97,15 +96,21 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         q_nope, q_pe = q
         decode_meta = attn_metadata.decode
         batch_size = q_nope.shape[0]
-        kv_block_size = attn_metadata.kv_cache_spec.block_size
+        kv_block_size = 16
 
         output = torch.empty((batch_size, self.num_heads, self.kv_lora_rank), 
                              dtype=q_nope.dtype, device=q_nope.device)
         
         max_seq_len = decode_meta.max_seq_len
-        # 启发式估算 Buffer 尺寸
-        MAX_POSSIBLE_SPLITS = (max_seq_len + 127) // 128
-        num_splits = max(1, min(128, 1 << (MAX_POSSIBLE_SPLITS - 1).bit_length() if MAX_POSSIBLE_SPLITS > 1 else 1))
+        current_device = q_nope.device
+        num_sms = torch.cuda.get_device_properties(current_device).multi_processor_count
+        
+        target_splits = (max_seq_len + 127) // 128
+
+        if batch_size * target_splits > num_sms * 2:
+            num_splits = 1
+        else:
+            num_splits = max(1, min(128, 1 << (target_splits - 1).bit_length() if target_splits > 1 else 1))
 
         mid_o = torch.zeros((batch_size, self.num_heads, num_splits, self.kv_lora_rank), 
                             dtype=torch.float32, device=q_nope.device)
@@ -113,19 +118,19 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                              dtype=torch.float32, device=q_nope.device)
 
         if HAS_KERNELS:
-            # Stage 1
+            # stage 1
             flash_mla_decode_stage_1_kernel[(batch_size, self.num_heads, num_splits)](
                 q_nope, q_pe, kv_cache, decode_meta.block_table, decode_meta.seq_lens, mid_o, mid_lse,
                 *q_nope.stride(), *q_pe.stride(), *kv_cache.stride(), *decode_meta.block_table.stride(),
                 *mid_o.stride(), *mid_lse.stride(),
-                self.scale, KV_BLOCK_SIZE=kv_block_size, D_LATENT=512, D_ROPE=64
+                self.scale, KV_BLOCK_SIZE=kv_block_size, D_LATENT=self.kv_lora_rank, D_ROPE=self.qk_rope_head_dim
             )
 
-            # Stage 2
+            # stage 2
             flash_mla_decode_stage_2_kernel[(batch_size, self.num_heads)](
                 mid_o, mid_lse, output,
                 *mid_o.stride(), *mid_lse.stride(), *output.stride(),
-                D_LATENT=512, NUM_SPLITS=num_splits
+                D_LATENT=self.kv_lora_rank, NUM_SPLITS=num_splits
             )
 
         return output, None
