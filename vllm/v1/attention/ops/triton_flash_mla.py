@@ -1,148 +1,141 @@
-import torch
 import triton
 import triton.language as tl
 
-# ============================================================================
-#  Flash MLA Prefill Kernel (Fixed for Non-Power-of-2 Head Dim)
-# ============================================================================
+# ==========================
+# Autotune 配置空间
+# ==========================
+
+def get_prefill_configs():
+    return [
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128}, num_warps=8, num_stages=4),
+    ]
+
+def get_decode_stage1_configs():
+    configs = []
+    for split_size in [128, 256]:
+        for block_n in [16, 32, 64]:
+            if block_n <= split_size:
+                 configs.append(triton.Config({'BLOCK_N': block_n, 'SPLIT_SIZE': split_size}, num_warps=4, num_stages=2))
+    for split_size in [512, 1024]:
+        for block_n in [64, 128, 256]:
+             if block_n <= split_size:
+                configs.append(triton.Config({'BLOCK_N': block_n, 'SPLIT_SIZE': split_size}, num_warps=8, num_stages=3))
+    return configs
+
+def get_decode_stage2_configs():
+    return [
+        triton.Config({}, num_warps=4),
+        triton.Config({}, num_warps=8),
+    ]
+
+# ==========================
+# Prefill Kernel
+# ==========================
+
+@triton.autotune(configs=get_prefill_configs(), key=['D_LATENT', 'D_ROPE'])
 @triton.jit
 def flash_mla_prefill_kernel(
-    Q_ptr, KV_ptr, cu_seqlens_ptr, Output_ptr,
-    stride_q_n, stride_q_h, stride_q_d,
-    stride_kv_n, stride_kv_h, stride_kv_d,
-    stride_o_n, stride_o_h, stride_o_d,
+    Q_nope_ptr, Q_pe_ptr, KV_ptr, cu_seqlens_ptr, Output_ptr,
+    stride_qnn, stride_qnh, stride_qnd,
+    stride_qpn, stride_qph, stride_qpd,
+    stride_kvn, stride_kvd,
+    stride_on, stride_oh, stride_od,
     sm_scale,
     D_LATENT: tl.constexpr, D_ROPE: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    # Grid: (M_blocks, Batch_Size, Heads)
     pid_m = tl.program_id(0); pid_b = tl.program_id(1); pid_h = tl.program_id(2)
     
-    HEAD_DIM: tl.constexpr = D_LATENT + D_ROPE
-    PADDED_HEAD_DIM: tl.constexpr = 1024 
+    start_q = tl.load(cu_seqlens_ptr + pid_b)
+    end_q = tl.load(cu_seqlens_ptr + pid_b + 1)
+    seq_len = end_q - start_q
+    
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_d_latent = tl.arange(0, D_LATENT)
+    offs_d_rope = tl.arange(0, D_ROPE)
+    
+    # 加载 Q (Nope & PE)
+    q_n_ptrs = Q_nope_ptr + (start_q + offs_m[:, None]) * stride_qnn + pid_h * stride_qnh + offs_d_latent[None, :] * stride_qnd
+    q_p_ptrs = Q_pe_ptr + (start_q + offs_m[:, None]) * stride_qpn + pid_h * stride_qph + offs_d_rope[None, :] * stride_qpd
+    
+    qn = tl.load(q_n_ptrs, mask=offs_m[:, None] < seq_len, other=0.0)
+    qp = tl.load(q_p_ptrs, mask=offs_m[:, None] < seq_len, other=0.0)
 
-    # 1. 读取当前 Batch 的 Sequence 范围
-    cu_seqlens_start = tl.load(cu_seqlens_ptr + pid_b)
-    cu_seqlens_end = tl.load(cu_seqlens_ptr + pid_b + 1)
-    seq_len = cu_seqlens_end - cu_seqlens_start
-    
-    # 越界检查
-    if pid_m * BLOCK_M >= seq_len: return
-    
-    # 2. 准备 Q 的索引
-    start_m = pid_m * BLOCK_M
-    offs_m = start_m + tl.arange(0, BLOCK_M)
-    q_token_idx = cu_seqlens_start + offs_m
-    mask_m = offs_m < seq_len
-    
-    offs_d = tl.arange(0, PADDED_HEAD_DIM)
-    mask_d = offs_d < HEAD_DIM
-    
-    # 3. 加载 Q
-    q_ptrs = Q_ptr + q_token_idx[:, None] * stride_q_n + pid_h * stride_q_h + offs_d[None, :] * stride_q_d
-    q = tl.load(q_ptrs, mask=mask_m[:, None] & mask_d[None, :], other=0.0)
-    # 类型转换: bf16 -> fp32 (scale) -> fp16 (for dot)
-    q = (q * sm_scale).to(tl.float16) 
-    
-    # 4. 初始化 Accumulator
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
-    l_i = tl.zeros([BLOCK_M], dtype=tl.float32) # Init to 0.0 is safer standard
+    l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
     acc = tl.zeros([BLOCK_M, D_LATENT], dtype=tl.float32)
-    
-    # 5. 循环 KV Blocks
-    # 因果 Mask: 只需要遍历到当前的 M Block 即可 (limit_n)
-    # limit_n 是当前 Q block 结束的位置，或者是 seq_len 的尽头
+
     limit_n = tl.minimum((pid_m + 1) * BLOCK_M, seq_len)
     
-    offs_d_latent = tl.arange(0, D_LATENT) # Hoisted out of loop
-
     for start_n in range(0, limit_n, BLOCK_N):
         offs_n = start_n + tl.arange(0, BLOCK_N)
-        kv_token_idx = cu_seqlens_start + offs_n
-        mask_n = offs_n < seq_len
         
-        # Load K
-        k_ptrs = KV_ptr + kv_token_idx[None, :] * stride_kv_n + offs_d[:, None] * stride_kv_d
-        k = tl.load(k_ptrs, mask=mask_n[None, :] & mask_d[:, None], other=0.0)
+        # 加载 KV
+        kv_base = KV_ptr + (start_q + offs_n[None, :]) * stride_kvn
+        kn_ptrs = kv_base + offs_d_latent[:, None] * stride_kvd
+        kp_ptrs = kv_base + (D_LATENT + offs_d_rope[:, None]) * stride_kvd
         
-        # Dot Product (fp16 accumulator, then cast to fp32)
-        # q: [M, D], k: [D, N] -> [M, N]
-        qk = tl.dot(q, k.to(tl.float16))
+        kn = tl.load(kn_ptrs, mask=offs_n[None, :] < seq_len, other=0.0)
+        kp = tl.load(kp_ptrs, mask=offs_n[None, :] < seq_len, other=0.0)
         
-        # Causal Masking
-        # 如果当前 KV Block 与 Q Block 重叠 (对角线 Block)，需要 Mask
-        if start_n + BLOCK_N > start_m:
-            mask_causal = offs_m[:, None] >= offs_n[None, :]
-            qk = tl.where(mask_causal, qk, float("-inf"))
+        # 分治点积
+        qk = (tl.dot(qn.to(tl.float16), kn.to(tl.float16)) + 
+              tl.dot(qp.to(tl.float16), kp.to(tl.float16))) * sm_scale
+
+        if start_n + BLOCK_N > pid_m * BLOCK_M:
+            qk = tl.where(offs_m[:, None] >= offs_n[None, :], qk, float("-inf"))
         
-        # Boundary Masking (Padding)
-        qk = tl.where(mask_n[None, :], qk, float("-inf"))
-            
-        # Softmax Update
+        # Online Softmax
         m_curr = tl.max(qk, 1)
         m_new = tl.maximum(m_i, m_curr)
-        
-        alpha = tl.exp(m_i - m_new)
         p = tl.exp(qk - m_new[:, None])
-        
-        # Load V
-        v_ptrs = KV_ptr + kv_token_idx[:, None] * stride_kv_n + offs_d_latent[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
+        alpha = tl.exp(m_i - m_new)
         
         acc = acc * alpha[:, None]
-        # p: [M, N], v: [N, D] -> [M, D]
-        acc = tl.dot(p.to(tl.float16), v.to(tl.float16), acc)
-        
-        l_curr = tl.sum(p, 1)
-        l_i = l_i * alpha + l_curr
+        acc = tl.dot(p.to(tl.float16), tl.trans(kn).to(tl.float16), acc)
+        l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_new
-        
-    # 6. Epilogue
+
     acc = acc / l_i[:, None]
-    
-    out_ptrs = Output_ptr + q_token_idx[:, None] * stride_o_n + pid_h * stride_o_h + offs_d_latent[None, :] * stride_o_d
-    tl.store(out_ptrs, acc.to(Output_ptr.dtype.element_ty), mask=mask_m[:, None])
+    out_ptrs = Output_ptr + (start_q + offs_m[:, None]) * stride_on + pid_h * stride_oh + offs_d_latent[None, :] * stride_od
+    tl.store(out_ptrs, acc.to(Output_ptr.dtype.element_ty), mask=offs_m[:, None] < seq_len)
 
+# ==========================
+# Decode Kernels (Stage 1 & 2)
+# ==========================
 
-# ============================================================================
-#  Flash MLA Decode Kernel - Stage 1 (Fixed for Non-Power-of-2 Head Dim)
-# ============================================================================
+@triton.autotune(configs=get_decode_stage1_configs(), key=['D_LATENT', 'D_ROPE', 'KV_BLOCK_SIZE'])
 @triton.jit
 def flash_mla_decode_stage_1_kernel(
-    Q_ptr, KV_Cache_ptr, Block_Table_ptr, Seq_Lens_ptr,
-    Mid_O_ptr, Mid_LSE_ptr,
-    stride_q_b, stride_q_h, stride_q_d,
-    stride_kv_block, stride_kv_offset, stride_kv_d,
-    stride_bt_b, stride_bt_s,
-    stride_mid_o_b, stride_mid_o_h, stride_mid_o_s, stride_mid_o_d,
-    stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s,
-    sm_scale,
-    KV_BLOCK_SIZE: tl.constexpr, 
-    D_LATENT: tl.constexpr, 
-    D_ROPE: tl.constexpr, 
-    BLOCK_N: tl.constexpr, 
-    SPLIT_SIZE: tl.constexpr,
+    Q_nope_ptr, Q_pe_ptr, KV_Cache_ptr, Block_Table_ptr, Seq_Lens_ptr, Mid_O_ptr, Mid_LSE_ptr,
+    stride_qnb, stride_qnh, stride_qnd,
+    stride_qpb, stride_qph, stride_qpd,
+    stride_kvb, stride_kvo, stride_kvd,
+    stride_btb, stride_bts,
+    stride_mid_ob, stride_mid_oh, stride_mid_os, stride_mid_od,
+    stride_mid_lb, stride_mid_lh, stride_mid_ls,
+    sm_scale, KV_BLOCK_SIZE: tl.constexpr, D_LATENT: tl.constexpr, D_ROPE: tl.constexpr, 
+    BLOCK_N: tl.constexpr, SPLIT_SIZE: tl.constexpr
 ):
     pid_b = tl.program_id(0); pid_h = tl.program_id(1); pid_s = tl.program_id(2)
-
-    HEAD_DIM: tl.constexpr = D_LATENT + D_ROPE
-    PADDED_HEAD_DIM: tl.constexpr = 1024 # Fix: Pad 576 to 1024
-
-    # 1. Load Query
-    offs_d = tl.arange(0, PADDED_HEAD_DIM)
-    mask_d = offs_d < HEAD_DIM
     
-    q_ptr = Q_ptr + pid_b * stride_q_b + pid_h * stride_q_h + offs_d * stride_q_d
-    q = tl.load(q_ptr, mask=mask_d, other=0.0)
-    q = (q * sm_scale).to(Q_ptr.dtype.element_ty)
+    offs_d_latent = tl.arange(0, D_LATENT)
+    offs_d_rope = tl.arange(0, D_ROPE)
+    
+    qn = tl.load(Q_nope_ptr + pid_b * stride_qnb + pid_h * stride_qnh + offs_d_latent * stride_qnd).to(tl.float32)
+    qp = tl.load(Q_pe_ptr + pid_b * stride_qpb + pid_h * stride_qph + offs_d_rope * stride_qpd).to(tl.float32)
 
     seq_len = tl.load(Seq_Lens_ptr + pid_b)
     start_n = pid_s * SPLIT_SIZE
     end_n = tl.minimum(start_n + SPLIT_SIZE, seq_len)
 
     if start_n >= seq_len:
-        lse_ptr = Mid_LSE_ptr + pid_b * stride_mid_lse_b + pid_h * stride_mid_lse_h + pid_s * stride_mid_lse_s
-        tl.store(lse_ptr, float("-inf"))
+        tl.store(Mid_LSE_ptr + pid_b * stride_mid_lb + pid_h * stride_mid_lh + pid_s * stride_mid_ls, float("-inf"))
         return
 
     m_i = float("-inf"); l_i = 0.0
@@ -152,84 +145,56 @@ def flash_mla_decode_stage_1_kernel(
         offs_n = curr_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < end_n
         
-        logical_block_ids = offs_n // KV_BLOCK_SIZE
-        block_offsets = offs_n % KV_BLOCK_SIZE
-        bt_ptrs = Block_Table_ptr + pid_b * stride_bt_b + logical_block_ids * stride_bt_s
-        physical_block_ids = tl.load(bt_ptrs, mask=mask_n, other=0)
+        l_block_id = offs_n // KV_BLOCK_SIZE
+        block_off = offs_n % KV_BLOCK_SIZE
+        p_block_id = tl.load(Block_Table_ptr + pid_b * stride_btb + l_block_id * stride_bts, mask=mask_n, other=0)
 
-        # Load K (Transposed [1024, BLOCK_N])
-        k_ptrs = KV_Cache_ptr + \
-                 physical_block_ids[:, None] * stride_kv_block + \
-                 block_offsets[:, None] * stride_kv_offset + \
-                 offs_d[None, :] * stride_kv_d
+        kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
+        kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd, mask=mask_n[:, None], other=0.0)
+        kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd, mask=mask_n[:, None], other=0.0)
         
-        k = tl.load(k_ptrs, mask=mask_n[:, None] & mask_d[None, :], other=0.0)
-        
-        # Compute Score [BLOCK_N]
-        # q: [1024], k: [BLOCK_N, 1024]
-        # broadcasting q to [1, 1024] * [BLOCK_N, 1024] -> sum(axis=1) -> [BLOCK_N]
-        score = tl.sum(q[None, :] * k, 1)
+        score = (tl.sum(qn[None, :] * kn, 1) + tl.sum(qp[None, :] * kp, 1)) * sm_scale
         score = tl.where(mask_n, score, float("-inf"))
 
         m_curr = tl.max(score, 0)
         m_new = tl.maximum(m_i, m_curr)
-        alpha = tl.exp(m_i - m_new)
         p = tl.exp(score - m_new)
+        alpha = tl.exp(m_i - m_new)
 
-        # Load V (Latent 512, OK)
-        offs_d_latent = tl.arange(0, D_LATENT)
-        v_ptrs = KV_Cache_ptr + \
-                 physical_block_ids[:, None] * stride_kv_block + \
-                 block_offsets[:, None] * stride_kv_offset + \
-                 offs_d_latent[None, :] * stride_kv_d
-        v = tl.load(v_ptrs, mask=mask_n[:, None], other=0.0)
-
-        weighted_v = tl.sum(v * p[:, None], 0)
-        acc = acc * alpha + weighted_v
+        acc = acc * alpha + tl.sum(kn * p[:, None], 0)
         l_i = l_i * alpha + tl.sum(p, 0)
         m_i = m_new
 
     if l_i > 0:
-        mid_o = acc / l_i
-        mid_lse = m_i + tl.log(l_i)
-    else:
-        mid_o = tl.zeros([D_LATENT], dtype=tl.float32)
-        mid_lse = float("-inf")
+        tl.store(Mid_O_ptr + pid_b * stride_mid_ob + pid_h * stride_mid_oh + pid_s * stride_mid_os + offs_d_latent * stride_mid_od, acc / l_i)
+        tl.store(Mid_LSE_ptr + pid_b * stride_mid_lb + pid_h * stride_mid_lh + pid_s * stride_mid_ls, m_i + tl.log(l_i))
 
-    offs_d_latent = tl.arange(0, D_LATENT)
-    o_ptr = Mid_O_ptr + pid_b * stride_mid_o_b + pid_h * stride_mid_o_h + \
-            pid_s * stride_mid_o_s + offs_d_latent * stride_mid_o_d
-    tl.store(o_ptr, mid_o)
-
-    lse_ptr = Mid_LSE_ptr + pid_b * stride_mid_lse_b + pid_h * stride_mid_lse_h + pid_s * stride_mid_lse_s
-    tl.store(lse_ptr, mid_lse)
-
-
-# ============================================================================
-#  Flash MLA Decode Kernel - Stage 2 (Keep this as is)
-# ============================================================================
+@triton.autotune(configs=get_decode_stage2_configs(), key=['D_LATENT', 'NUM_SPLITS'])
 @triton.jit
 def flash_mla_decode_stage_2_kernel(
     Mid_O_ptr, Mid_LSE_ptr, Output_ptr,
-    stride_mid_o_b, stride_mid_o_h, stride_mid_o_s, stride_mid_o_d,
-    stride_mid_lse_b, stride_mid_lse_h, stride_mid_lse_s,
-    stride_out_b, stride_out_h, stride_out_d,
-    D_LATENT: tl.constexpr, 
-    NUM_SPLITS: tl.constexpr
+    stride_mob, stride_moh, stride_mos, stride_mod,
+    stride_mlb, stride_mlh, stride_mls,
+    stride_ob, stride_oh, stride_od,
+    D_LATENT: tl.constexpr, NUM_SPLITS: tl.constexpr
 ):
     pid_b = tl.program_id(0); pid_h = tl.program_id(1)
     offs_s = tl.arange(0, NUM_SPLITS)
     offs_d = tl.arange(0, D_LATENT)
-    lse_ptr = Mid_LSE_ptr + pid_b * stride_mid_lse_b + pid_h * stride_mid_lse_h + offs_s * stride_mid_lse_s
-    lse = tl.load(lse_ptr, mask=offs_s < NUM_SPLITS, other=float("-inf"))
+    
+    lse = tl.load(Mid_LSE_ptr + pid_b * stride_mlb + pid_h * stride_mlh + offs_s * stride_mls)
     m_global = tl.max(lse, 0)
-    if m_global == float("-inf"): weights = tl.zeros([NUM_SPLITS], dtype=tl.float32)
-    else: weights = tl.exp(lse - m_global)
-    sum_weights = tl.sum(weights, 0)
-    mid_o_ptr = Mid_O_ptr + pid_b * stride_mid_o_b + pid_h * stride_mid_o_h + offs_s[:, None] * stride_mid_o_s + offs_d[None, :] * stride_mid_o_d
-    mid_o = tl.load(mid_o_ptr, mask=offs_s[:, None] < NUM_SPLITS, other=0.0)
-    weighted_o = mid_o * weights[:, None]
-    final_o = tl.sum(weighted_o, 0)
-    if sum_weights > 0: final_o = final_o / sum_weights
-    out_ptr = Output_ptr + pid_b * stride_out_b + pid_h * stride_out_h + offs_d * stride_out_d
-    tl.store(out_ptr, final_o.to(Output_ptr.dtype.element_ty))
+    
+    if m_global == float("-inf"):
+        tl.store(Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, 0.0)
+        return
+
+    weights = tl.exp(lse - m_global)
+    weights = tl.where(lse > float("-inf"), weights, 0.0)
+    sum_w = tl.sum(weights, 0)
+    
+    mid_o_ptrs = Mid_O_ptr + pid_b * stride_mob + pid_h * stride_moh + offs_s[:, None] * stride_mos + offs_d[None, :] * stride_mod
+    mid_o = tl.load(mid_o_ptrs, mask=lse[:, None] > float("-inf"), other=0.0)
+    
+    final_o = tl.sum(mid_o * weights[:, None], 0) / sum_w
+    tl.store(Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, final_o.to(Output_ptr.dtype.element_ty))
