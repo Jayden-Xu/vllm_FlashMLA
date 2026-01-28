@@ -1,5 +1,16 @@
 <!-- markdownlint-disable MD001 MD041 -->
-# vLLM_FlashMLA: A custom fork integrating [FlashMLA](https://github.com/Jayden-Xu/FlashMLA).
+
+# vLLM-FlashMLA: High-Performance Integration of [FlashMLA](https://github.com/Jayden-Xu/FlashMLA).
+
+This fork integrates **FlashMLA**, a customized Triton kernel optimized for MLA architectures. 
+
+## Benchmark Results
+
+Running on **NVIDIA A100-80GB** with **DeepSeek-V2-Lite-Chat**.
+
+![FlashMLA Benchmark](./assets/vllm_flashmla_benchmark.png)
+
+---
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
