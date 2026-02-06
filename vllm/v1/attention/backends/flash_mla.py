@@ -1,7 +1,6 @@
 import torch
-import triton
 from dataclasses import dataclass
-from typing import ClassVar, Tuple, Optional, Any, Union
+from typing import ClassVar
 
 from vllm.config import VllmConfig
 from vllm.config.cache import CacheDType
@@ -15,22 +14,18 @@ from vllm.model_executor.layers.attention.mla_attention import (
     QueryLenSupport,
 )
 from vllm.platforms.interface import DeviceCapability
-from vllm.v1.attention.backend import (
-    AttentionCGSupport,
-    AttentionType,
-    MultipleOf,
-)
+from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 try:
     from vllm.v1.attention.ops.triton_flash_mla import (
-        flash_mla_prefill_kernel,
         flash_mla_decode_stage_1_kernel,
-        flash_mla_decode_stage_2_kernel
+        flash_mla_decode_stage_2_kernel,
+        flash_mla_decode_fused_kernel
     )
-    HAS_KERNELS = True
+    HAS_DECODE_KERNELS = True
 except ImportError:
-    HAS_KERNELS = False
+    HAS_DECODE_KERNELS = False
 
 logger = init_logger(__name__)
 
@@ -38,17 +33,21 @@ logger = init_logger(__name__)
 class FlashMLADecodeMetadata(MLACommonDecodeMetadata):
     max_seq_len: int
 
+
 @dataclass
 class FlashMLAMetadata(MLACommonMetadata[FlashMLADecodeMetadata]):
     pass
+
 
 class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
     _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
     query_len_support: ClassVar[QueryLenSupport] = QueryLenSupport.VARLEN
 
+
     def __init__(self, kv_cache_spec: AttentionSpec, layer_names: list[str], 
                  vllm_config: VllmConfig, device: torch.device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device, FlashMLAMetadata)
+
 
     def _build_decode(self, block_table_tensor: torch.Tensor, seq_lens_device: torch.Tensor, 
                       max_seq_len: int, query_start_loc_cpu: torch.Tensor, 
@@ -62,102 +61,139 @@ class FlashMLAMetadataBuilder(MLACommonMetadataBuilder[FlashMLAMetadata]):
         )
 
 class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
+    _printed_configs = set()
+    _backend_logged = False
+    _log_fused_once = True 
+    _log_splitk_once = True
+    
+
     def __init__(self, **mla_args) -> None:
         super().__init__(**mla_args)
-        self.kv_lora_rank = mla_args.get("kv_lora_rank", 512)
+        self.scale = mla_args.get("scale", 1.0)
         self.qk_rope_head_dim = mla_args.get("qk_rope_head_dim", 64)
-        logger.info(f"⚡ [FlashMLA] Backend Loaded (Latent={self.kv_lora_rank}, RoPE={self.qk_rope_head_dim})")
-
-    def _run_prefill_triton_impl(self, q, k, v, attn_metadata, kv_cache=None, **kwargs):
-        q_nope, q_pe = q if isinstance(q, tuple) else (q[..., :self.kv_lora_rank], q[..., self.kv_lora_rank:])
-        k_final = torch.cat([v, k], dim=-1)
-
-        if kv_cache is not None and attn_metadata.slot_mapping is not None:
-            slot_mapping = attn_metadata.slot_mapping.flatten()
-            kv_cache.view(-1, kv_cache.shape[-1])[slot_mapping] = k_final.view(-1, k_final.shape[-1])
-
-        output = torch.empty((q_nope.shape[0], self.num_heads, self.kv_lora_rank), 
-                             dtype=q_nope.dtype, device=q_nope.device)
         
-        if HAS_KERNELS:
-            q_start_loc = attn_metadata.query_start_loc
-            grid = lambda META: (triton.cdiv(attn_metadata.max_query_len, META['BLOCK_M']), q_start_loc.shape[0] - 1, self.num_heads)
-            
-            flash_mla_prefill_kernel[grid](
-                q_nope, q_pe, k_final, q_start_loc, output,
-                *q_nope.stride(), *q_pe.stride(), 
-                k_final.stride(0), k_final.stride(2), 
-                *output.stride(),
-                self.scale, D_LATENT=self.kv_lora_rank, D_ROPE=self.qk_rope_head_dim
-            )
-        return output
+        if not FlashMLAImpl._backend_logged:
+            logger.info(f"[FlashMLA] Backend Hijacked (scale={self.scale:.4f}, rope_dim={self.qk_rope_head_dim})")
+            FlashMLAImpl._backend_logged = True
+
 
     def _forward_decode(self, q, kv_cache, attn_metadata, layer=None):
+
         q_nope, q_pe = q
         decode_meta = attn_metadata.decode
         batch_size = q_nope.shape[0]
-        kv_block_size = 16
-
-        output = torch.empty((batch_size, self.num_heads, self.kv_lora_rank), 
-                             dtype=q_nope.dtype, device=q_nope.device)
-        
+        actual_latent_dim = q_nope.shape[-1]
         max_seq_len = decode_meta.max_seq_len
-        current_device = q_nope.device
-        num_sms = torch.cuda.get_device_properties(current_device).multi_processor_count
+        device = q_nope.device
         
-        target_splits = (max_seq_len + 127) // 128
-
-        if batch_size * target_splits > num_sms * 2:
+        num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+        base_splits = (max_seq_len + 255) // 256
+        
+        if batch_size >= 32:
             num_splits = 1
         else:
-            num_splits = max(1, min(128, 1 << (target_splits - 1).bit_length() if target_splits > 1 else 1))
+            if batch_size <= 4:
+                num_splits = min(base_splits, 64)
+            elif batch_size * base_splits <= num_sms * 4:
+                num_splits = base_splits
+            else:
+                num_splits = max(1, (num_sms * 4) // batch_size)
+            
+            if num_splits > 1:
+                num_splits = 1 << (num_splits - 1).bit_length()
+            num_splits = min(num_splits, 128)
 
-        mid_o = torch.zeros((batch_size, self.num_heads, num_splits, self.kv_lora_rank), 
-                            dtype=torch.float32, device=q_nope.device)
-        mid_lse = torch.full((batch_size, self.num_heads, num_splits), float("-inf"), 
-                             dtype=torch.float32, device=q_nope.device)
+        
+        output = torch.empty((batch_size, self.num_heads, actual_latent_dim), 
+                             dtype=q_nope.dtype, device=device)
 
-        if HAS_KERNELS:
-            # stage 1
+        if num_splits == 1:
+            flash_mla_decode_fused_kernel[(batch_size, self.num_heads)](
+                q_nope, q_pe, kv_cache, 
+                decode_meta.block_table, decode_meta.seq_lens, 
+                output,
+                *q_nope.stride(), 
+                *q_pe.stride(), 
+                *kv_cache.stride(), 
+                *decode_meta.block_table.stride(),
+                *output.stride(),
+                self.scale, 
+                KV_BLOCK_SIZE=kv_cache.shape[-2], 
+                D_LATENT=actual_latent_dim, 
+                D_ROPE=self.qk_rope_head_dim,
+            )
+            
+            if FlashMLAImpl._log_fused_once and hasattr(flash_mla_decode_fused_kernel, 'best_config'):
+                self._print_best_config("Fused Path", flash_mla_decode_fused_kernel)
+                FlashMLAImpl._log_fused_once = False
+
+        else:
+            actual_split_size = (max_seq_len + num_splits - 1) // num_splits
+            
+            mid_o = torch.empty((batch_size, self.num_heads, num_splits, actual_latent_dim), 
+                                dtype=torch.float32, device=device)
+            mid_lse = torch.full((batch_size, self.num_heads, num_splits), 
+                                 float("-inf"), dtype=torch.float32, device=device)
+
             flash_mla_decode_stage_1_kernel[(batch_size, self.num_heads, num_splits)](
-                q_nope, q_pe, kv_cache, decode_meta.block_table, decode_meta.seq_lens, mid_o, mid_lse,
-                *q_nope.stride(), *q_pe.stride(), *kv_cache.stride(), *decode_meta.block_table.stride(),
-                *mid_o.stride(), *mid_lse.stride(),
-                self.scale, KV_BLOCK_SIZE=kv_block_size, D_LATENT=self.kv_lora_rank, D_ROPE=self.qk_rope_head_dim
+                q_nope, q_pe, kv_cache, decode_meta.block_table, decode_meta.seq_lens, 
+                mid_o, mid_lse,
+                *q_nope.stride(), *q_pe.stride(), *kv_cache.stride(), 
+                *decode_meta.block_table.stride(), *mid_o.stride(), *mid_lse.stride(),
+                self.scale, int(actual_split_size), 
+                KV_BLOCK_SIZE=kv_cache.shape[-2], D_LATENT=actual_latent_dim, D_ROPE=self.qk_rope_head_dim,
             )
 
-            # stage 2
             flash_mla_decode_stage_2_kernel[(batch_size, self.num_heads)](
                 mid_o, mid_lse, output,
                 *mid_o.stride(), *mid_lse.stride(), *output.stride(),
-                D_LATENT=self.kv_lora_rank, NUM_SPLITS=num_splits
+                int(num_splits), D_LATENT=actual_latent_dim, 
             )
 
+            if FlashMLAImpl._log_splitk_once and hasattr(flash_mla_decode_stage_1_kernel, 'best_config'):
+                self._print_best_config("Split-K Stage 1", flash_mla_decode_stage_1_kernel)
+                self._print_best_config("Split-K Stage 2", flash_mla_decode_stage_2_kernel)
+                FlashMLAImpl._log_splitk_once = False
+
         return output, None
+
+
+    def _print_best_config(self, name, kernel):
+        if hasattr(kernel, 'best_config'):
+            cfg = kernel.best_config
+            parts = [f"warps={cfg.num_warps}", f"stages={cfg.num_stages}"]
+            if hasattr(cfg, 'kwargs') and cfg.kwargs:
+                for k, v in cfg.kwargs.items():
+                    parts.append(f"{k}={v}")
+            config_str = "{" + ", ".join(parts) + "}"
+            logger.info(f"[FlashMLA] {name}: {config_str}")
+
 
 class FlashMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
     
+
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
-        return [MultipleOf(16)]
-    
-    @staticmethod
-    def get_name() -> str:
+    def get_name() -> str: 
         return "FLASH_MLA"
-    
+
+
     @staticmethod
-    def get_builder_cls() -> type["FlashMLAMetadataBuilder"]:
-        return FlashMLAMetadataBuilder
-    
-    @staticmethod
-    def get_impl_cls() -> type["FlashMLAImpl"]:
+    def get_impl_cls(): 
         return FlashMLAImpl
-    
+
+
+    @staticmethod
+    def get_builder_cls(): 
+        return FlashMLAMetadataBuilder
+
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(): 
+        return [MultipleOf(16)]
+
+
     @classmethod
-    def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        import os
-        if os.getenv("DISABLE_FLASH_MLA") == "1":
-            return False
-        return capability.major >= 8
+    def supports_compute_capability(cls, capability: DeviceCapability):
+        return capability >= DeviceCapability(8, 0)
