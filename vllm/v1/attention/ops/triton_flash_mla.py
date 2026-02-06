@@ -2,28 +2,11 @@ import triton
 import triton.language as tl
 
 
-def get_decode_stage1_configs():
-    return [
-        triton.Config({'BLOCK_N': 32}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 64}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 64}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=4),
-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=3),
-    ]
-
-
-def get_decode_stage2_configs():
-    return [
-        triton.Config({}, num_warps=4),
-        triton.Config({}, num_warps=8),
-    ]
-
-
-@triton.autotune(
-    configs=get_decode_stage1_configs(), 
-    key=['D_LATENT', 'KV_BLOCK_SIZE'] 
-)
+@triton.heuristics({
+    'BLOCK_N': lambda kwargs: 64,
+    'num_warps': lambda kwargs: 4,
+    'num_stages': lambda kwargs: 2,
+})
 @triton.jit
 def flash_mla_decode_stage_1_kernel(
     Q_nope_ptr, Q_pe_ptr, KV_Cache_ptr, Block_Table_ptr, Seq_Lens_ptr, Mid_O_ptr, Mid_LSE_ptr,
@@ -95,10 +78,10 @@ def flash_mla_decode_stage_1_kernel(
     tl.store(Mid_O_ptr + pid_b * stride_mid_ob + pid_h * stride_mid_oh + pid_s * stride_mid_os + offs_d_latent * stride_mid_od, acc * inv_l)
     tl.store(Mid_LSE_ptr + pid_b * stride_mid_lb + pid_h * stride_mid_lh + pid_s * stride_mid_ls, tl.where(l_i > 0, m_i + tl.log(l_i), float("-inf")))
 
-@triton.autotune(
-    configs=get_decode_stage2_configs(), 
-    key=['D_LATENT']
-)
+@triton.heuristics({
+    'num_warps': lambda kwargs: 8,
+    'num_stages': lambda kwargs: 3,
+})
 @triton.jit
 def flash_mla_decode_stage_2_kernel(
     Mid_O_ptr, Mid_LSE_ptr, Output_ptr,
@@ -134,10 +117,11 @@ def flash_mla_decode_stage_2_kernel(
     tl.store(Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, final_o.to(Output_ptr.dtype.element_ty))
 
 
-@triton.autotune(
-    configs=get_decode_stage1_configs(),
-    key=['D_LATENT', 'KV_BLOCK_SIZE']
-)
+@triton.heuristics({
+    'BLOCK_N': lambda kwargs: 64,
+    'num_warps': lambda kwargs: 4,
+    'num_stages': lambda kwargs: 2,
+})
 @triton.jit
 def flash_mla_decode_fused_kernel(
     Q_nope_ptr, Q_pe_ptr, KV_Cache_ptr, Block_Table_ptr, Seq_Lens_ptr, Output_ptr,

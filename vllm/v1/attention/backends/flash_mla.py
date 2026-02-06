@@ -132,8 +132,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             
             mid_o = torch.empty((batch_size, self.num_heads, num_splits, actual_latent_dim), 
                                 dtype=torch.float32, device=device)
-            mid_lse = torch.full((batch_size, self.num_heads, num_splits), 
-                                 float("-inf"), dtype=torch.float32, device=device)
+            mid_lse = torch.empty((batch_size, self.num_heads, num_splits), 
+                                 dtype=torch.float32, device=device)
 
             flash_mla_decode_stage_1_kernel[(batch_size, self.num_heads, num_splits)](
                 q_nope, q_pe, kv_cache, decode_meta.block_table, decode_meta.seq_lens, 
