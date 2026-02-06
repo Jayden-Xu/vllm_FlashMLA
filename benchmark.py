@@ -1,4 +1,5 @@
 import subprocess
+import time
 import re
 import os
 import csv
@@ -11,6 +12,7 @@ GPU_MEM_UTIL = "0.9"
 ENV_VAR_NAME = "DISABLE_FLASH_MLA" 
 TRITON_CACHE_DIR = os.path.expanduser("~/.triton/cache")
 MAX_MODEL_LEN = 8192 # limit GPU memory
+GPU_COOLDOWN_SECONDS = 5
 
 DECODE_FOCUSED_CONFIGS = [
     (512, 512, [1, 16, 32, 64, 128], "Balanced"),
@@ -121,10 +123,14 @@ def main():
                 out_base = run_vllm_throughput(True, in_len, out_len, bs)
                 base_tps, _ = parse_throughput(out_base)
 
+                time.sleep(GPU_COOLDOWN_SECONDS)
+
                 # ours
                 clear_triton_cache()
                 warmup_out = run_vllm_throughput(False, in_len, out_len, bs, is_warmup=True)
                 _, best_config = parse_throughput(warmup_out)
+
+                time.sleep(GPU_COOLDOWN_SECONDS)
                 
                 real_out = run_vllm_throughput(False, in_len, out_len, bs)
                 ours_tps, _ = parse_throughput(real_out)

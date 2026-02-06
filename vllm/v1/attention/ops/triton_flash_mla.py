@@ -3,9 +3,9 @@ import triton.language as tl
 
 
 @triton.heuristics({
-    'BLOCK_N': lambda kwargs: 64,
+    'BLOCK_N': lambda kwargs: 32,
     'num_warps': lambda kwargs: 4,
-    'num_stages': lambda kwargs: 2,
+    'num_stages': lambda kwargs: 3,
 })
 @triton.jit
 def flash_mla_decode_stage_1_kernel(
@@ -16,12 +16,12 @@ def flash_mla_decode_stage_1_kernel(
     stride_btb, stride_bts,
     stride_mid_ob, stride_mid_oh, stride_mid_os, stride_mid_od,
     stride_mid_lb, stride_mid_lh, stride_mid_ls,
-    sm_scale, 
+    sm_scale,
     SPLIT_SIZE, # do not trigger autotune
-    KV_BLOCK_SIZE: tl.constexpr, 
-    D_LATENT: tl.constexpr, 
-    D_ROPE: tl.constexpr,   
-    BLOCK_N: tl.constexpr, 
+    KV_BLOCK_SIZE: tl.constexpr,
+    D_LATENT: tl.constexpr,
+    D_ROPE: tl.constexpr,
+    BLOCK_N: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
@@ -80,7 +80,7 @@ def flash_mla_decode_stage_1_kernel(
 
 @triton.heuristics({
     'num_warps': lambda kwargs: 8,
-    'num_stages': lambda kwargs: 3,
+    'num_stages': lambda kwargs: 2,
 })
 @triton.jit
 def flash_mla_decode_stage_2_kernel(
@@ -118,9 +118,9 @@ def flash_mla_decode_stage_2_kernel(
 
 
 @triton.heuristics({
-    'BLOCK_N': lambda kwargs: 64,
-    'num_warps': lambda kwargs: 4,
-    'num_stages': lambda kwargs: 2,
+    'BLOCK_N': lambda kwargs: 32,
+    'num_warps': lambda kwargs: 8,
+    'num_stages': lambda kwargs: 3,
 })
 @triton.jit
 def flash_mla_decode_fused_kernel(
