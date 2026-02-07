@@ -119,7 +119,7 @@ def flash_mla_decode_stage_2_kernel(
 
 @triton.heuristics({
     'BLOCK_N': lambda kwargs: 32,
-    'num_warps': lambda kwargs: 8,
+    'num_warps': lambda kwargs: 4,
     'num_stages': lambda kwargs: 3,
 })
 @triton.jit
