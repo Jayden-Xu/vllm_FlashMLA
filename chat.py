@@ -14,6 +14,7 @@ def main():
     try:
         llm = LLM(
             model=model_name,
+            max_model_len=4096,
             trust_remote_code=True,
             dtype="bfloat16",
             gpu_memory_utilization=0.8,
