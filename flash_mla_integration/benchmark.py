@@ -11,15 +11,17 @@ MODEL_PATH = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 GPU_MEM_UTIL = "0.9"
 ENV_VAR_NAME = "DISABLE_FLASH_MLA" 
 TRITON_CACHE_DIR = os.path.expanduser("~/.triton/cache")
-MAX_MODEL_LEN = 16384 # limit GPU memory
+MAX_MODEL_LEN = 33000 # limit GPU memory
 GPU_COOLDOWN_SECONDS = 10
 
 DECODE_FOCUSED_CONFIGS = [
-    (2048, 1024, [1, 16, 32, 64, 128]),
-    (8192, 1024, [1, 16, 32, 64, 128])
+    (2048, 256, [1, 16, 32, 64, 128]),
+    (4096, 256, [1, 16, 32, 64, 128]),
+    (8192, 256, [1, 16, 32, 64, 128]),
+    (16384, 256, [1, 16, 32, 64, 128]),
+    (32768, 256, [1, 16, 32, 64, 128]),
 ]
 
-VERIFY_NUM_TOKENS = 64
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
 CSV_FILE = f"decode_bench_{TIMESTAMP}.csv"
 LOG_DIR = f"decode_logs_{TIMESTAMP}"
