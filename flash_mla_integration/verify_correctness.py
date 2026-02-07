@@ -6,7 +6,7 @@ import time
 MODEL_PATH = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 
 TEST_CASES = [
-    {"name": "Fused Kernel (BS=64)", "in_len": 1024, "bs": 64},
+    {"name": "Fused Kernel (BS=64)", "in_len": 1000, "bs": 64},
     {"name": "Split-K Kernel (BS=1)", "in_len": 8000, "bs": 1},
 ]
 
