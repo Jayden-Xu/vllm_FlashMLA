@@ -102,7 +102,6 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             if num_splits > 1:
                 num_splits = 1 << (num_splits - 1).bit_length()
             num_splits = min(num_splits, 128)
-
         
         output = torch.empty((batch_size, self.num_heads, actual_latent_dim), 
                              dtype=q_nope.dtype, device=device)
@@ -123,8 +122,10 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 D_ROPE=self.qk_rope_head_dim,
             )
             
-            if FlashMLAImpl._log_fused_once and hasattr(flash_mla_decode_fused_kernel, 'best_config'):
-                self._print_best_config("Fused Path", flash_mla_decode_fused_kernel)
+            if FlashMLAImpl._log_fused_once:
+                if hasattr(flash_mla_decode_fused_kernel, 'best_config'):
+                    self._print_best_config("Fused Path", flash_mla_decode_fused_kernel)
+                print("[FlashMLA]: Fused Path")
                 FlashMLAImpl._log_fused_once = False
 
         else:
@@ -154,9 +155,11 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 int(num_splits), D_LATENT=actual_latent_dim, 
             )
 
-            if FlashMLAImpl._log_splitk_once and hasattr(flash_mla_decode_stage_1_kernel, 'best_config'):
-                self._print_best_config("Split-K Stage 1", flash_mla_decode_stage_1_kernel)
-                self._print_best_config("Split-K Stage 2", flash_mla_decode_stage_2_kernel)
+            if FlashMLAImpl._log_splitk_once:
+                if hasattr(flash_mla_decode_stage_1_kernel, 'best_config') and hasattr(flash_mla_decode_stage_2_kernel, 'best_config'):
+                    self._print_best_config("Split-K Stage 1", flash_mla_decode_stage_1_kernel)
+                    self._print_best_config("Split-K Stage 2", flash_mla_decode_stage_2_kernel)
+                print("[FlashMLA]: Split-K Path")
                 FlashMLAImpl._log_splitk_once = False
 
         return output, None

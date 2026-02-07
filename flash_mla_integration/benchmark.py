@@ -28,6 +28,7 @@ LOG_DIR = f"decode_logs_{TIMESTAMP}"
 
 GREEN = "\033[92m"
 RED = "\033[91m"
+CYAN = "\033[96m"
 RESET = "\033[0m"
 BOLD = "\033[1m"
 
@@ -72,6 +73,12 @@ def parse_throughput(output: Optional[str]) -> Tuple[float, str]:
     if not output or any(x in output for x in ["ERROR", "CRASH", "out of memory"]): 
         return 0.0, "Err/OOM"
     
+    mode = "Base"
+    if "[FlashMLA]: Fused Path" in output:
+        mode = "Fused"
+    elif "[FlashMLA]: Split-K Path" in output:
+        mode = "Split-K"
+
     raw_matches = re.findall(r"\[FlashMLA\] (.*?): \{(.*?)\}", output)
     
     parsed_configs = {}
@@ -104,44 +111,45 @@ def parse_throughput(output: Optional[str]) -> Tuple[float, str]:
     if not m: m = re.search(r"Throughput:\s+([\d\.]+)", output)
     if m: val = float(m.group(1))
     
-    return val, best_config
+    return val, mode, best_config
 
 def main():
     print(f"{BOLD}FlashMLA Benchmark (MaxLen={MAX_MODEL_LEN}){RESET}")
     
     print(f"\n{BOLD}Phase: Performance Benchmark{RESET}")
     print("=" * 115)
-    print(f"{'In':<6} {'Out':<6} {'BS':<5} {'Base_TPS':<12} {'Ours_TPS':<12} {'Speedup':<15} {'Best Config'}")
+    print(f"{'In':<6} {'Out':<6} {'BS':<5} {'Mode':<10} {'Base_TPS':<12} {'Ours_TPS':<12} {'Speedup':<15} {'Best Config'}")
     print("-" * 115)
 
     with open(CSV_FILE, 'w', newline='') as f:
         writer = csv.writer(f)
-        writer.writerow(["In", "Out", "BS", "Base_TPS", "Ours_TPS", "Speedup", "Config"])
+        writer.writerow(["In", "Out", "BS" "Mode", "Base_TPS", "Ours_TPS", "Speedup", "Config"])
         
         for in_len, out_len, batch_sizes in DECODE_FOCUSED_CONFIGS:
             for bs in batch_sizes:
                 # vLLM baseline
                 out_base = run_vllm_throughput(True, in_len, out_len, bs)
-                base_tps, _ = parse_throughput(out_base)
+                base_tps, _, _ = parse_throughput(out_base)
 
                 time.sleep(GPU_COOLDOWN_SECONDS)
 
                 # ours
                 clear_triton_cache()
                 warmup_out = run_vllm_throughput(False, in_len, out_len, bs, is_warmup=True)
-                _, best_config = parse_throughput(warmup_out)
+                _, mode_detected, best_config = parse_throughput(warmup_out)
 
                 time.sleep(GPU_COOLDOWN_SECONDS)
                 
                 real_out = run_vllm_throughput(False, in_len, out_len, bs)
-                ours_tps, _ = parse_throughput(real_out)
+                ours_tps, _, _ = parse_throughput(real_out)
 
                 speedup = ours_tps / base_tps if base_tps > 0 else 0
 
                 color = GREEN if speedup >= 1.05 else RED if speedup < 0.95 else ""
                 speedup_str = f"{color}{speedup:>7.2f}x{RESET}"
+                mode_str = f"{CYAN}{mode_detected}{RESET}"
                 
-                print(f"{in_len:<6} {out_len:<6} {bs:<5} {base_tps:<12.1f} {ours_tps:<12.1f} {speedup_str:<24} {best_config}")
+                print(f"{in_len:<6} {out_len:<6} {bs:<5} {mode_str:<19} {base_tps:<12.1f} {ours_tps:<12.1f} {speedup_str:<24} {best_config}")
                 
                 writer.writerow([in_len, out_len, bs, base_tps, ours_tps, f"{speedup:.2f}x", best_config])
                 f.flush()
