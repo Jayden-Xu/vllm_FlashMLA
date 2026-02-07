@@ -46,7 +46,41 @@ def flash_mla_decode_stage_1_kernel(
     l_i = 0.0
     acc = tl.zeros([D_LATENT], dtype=tl.float32)
 
-    for curr_n in range(start_n, end_n, BLOCK_N):
+    num_valid_tokens = end_n - start_n
+    num_full_blocks = num_valid_tokens // BLOCK_N
+    limit = start_n + num_full_blocks * BLOCK_N
+
+    # 2. 飙车区 (Main Loop) - 无 Mask，全速运行
+    for curr_n in range(start_n, limit, BLOCK_N):
+        offs_n = curr_n + tl.arange(0, BLOCK_N)
+        # mask_n = offs_n < end_n  <-- 删掉这句！
+        
+        l_block_id = offs_n // KV_BLOCK_SIZE
+        p_block_id = tl.load(Block_Table_ptr + pid_b * stride_btb + l_block_id * stride_bts) # 去掉 mask
+        block_off = offs_n % KV_BLOCK_SIZE
+
+        kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
+        
+        # [重点] 去掉 mask 参数
+        kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd).to(tl.float16)
+        kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd).to(tl.float16)
+        
+        # 计算 Attention
+        score = (tl.sum(qn[None, :] * kn, 1) + tl.sum(qp[None, :] * kp, 1)) * sm_scale
+        # score = tl.where(mask_n, score, float("-inf")) <-- 不需要 where
+
+        m_curr = tl.max(score, 0)
+        m_new = tl.maximum(m_i, m_curr)
+        p = tl.exp(score - m_new)
+        alpha = tl.exp(m_i - m_new)
+
+        acc = acc * alpha + tl.sum(kn.to(tl.float32) * p[:, None], 0)
+        l_i = l_i * alpha + tl.sum(p, 0)
+        m_i = m_new
+
+    # 3. 停车区 (Epilogue) - 处理剩下的不足 32 个 Token
+    if limit < end_n:
+        curr_n = limit
         offs_n = curr_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < end_n
         
@@ -56,20 +90,17 @@ def flash_mla_decode_stage_1_kernel(
 
         kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
         
-        # read separately to avoid not a power of 2 error
         kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd, mask=mask_n[:, None], other=0.0).to(tl.float16)
         kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd, mask=mask_n[:, None], other=0.0).to(tl.float16)
         
         score = (tl.sum(qn[None, :] * kn, 1) + tl.sum(qp[None, :] * kp, 1)) * sm_scale
         score = tl.where(mask_n, score, float("-inf"))
 
-        # online Softmax
         m_curr = tl.max(score, 0)
         m_new = tl.maximum(m_i, m_curr)
         p = tl.exp(score - m_new)
         alpha = tl.exp(m_i - m_new)
 
-        # accumulate in fp32
         acc = acc * alpha + tl.sum(kn.to(tl.float32) * p[:, None], 0)
         l_i = l_i * alpha + tl.sum(p, 0)
         m_i = m_new
@@ -113,7 +144,7 @@ def flash_mla_decode_stage_2_kernel(
     mid_o_ptrs = Mid_O_ptr + pid_b * stride_mob + pid_h * stride_moh + offs_s[:, None] * stride_mos + offs_d[None, :] * stride_mod
     mid_o = tl.load(mid_o_ptrs, mask=mask_s[:, None], other=0.0)
     
-    final_o = tl.sum(mid_o * weights[:, None], 0) / sum_w
+    final_o = tl.sum(mid_o * weights[:, None], 0) / (sum_w + 1e-10)
     tl.store(Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, final_o.to(Output_ptr.dtype.element_ty))
 
 
@@ -151,8 +182,41 @@ def flash_mla_decode_fused_kernel(
     l_i = 0.0
     acc = tl.zeros([D_LATENT], dtype=tl.float32)
 
-    for curr_n in range(0, seq_len, BLOCK_N):
-        offs_n = curr_n + tl.arange(0, BLOCK_N)
+    num_full_blocks = seq_len // BLOCK_N
+    limit = num_full_blocks * BLOCK_N
+
+    for start_n in range(0, limit, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        
+        # 计算 Block ID (不需要 mask)
+        l_block_id = offs_n // KV_BLOCK_SIZE
+        p_block_id = tl.load(Block_Table_ptr + pid_b * stride_btb + l_block_id * stride_bts)
+        block_off = offs_n % KV_BLOCK_SIZE
+
+        kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
+        
+        # [重点] 加载 KV 时去掉 mask 参数
+        kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd).to(tl.float16)
+        kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd).to(tl.float16)
+        
+        # 计算 Attention Score
+        score = (tl.sum(qn[None, :] * kn, 1) + tl.sum(qp[None, :] * kp, 1)) * sm_scale
+        # 注意：这里不需要 tl.where(mask...)，因为全是合法的
+
+        # Update Softmax
+        m_curr = tl.max(score, 0)
+        m_new = tl.maximum(m_i, m_curr)
+        p = tl.exp(score - m_new)
+        alpha = tl.exp(m_i - m_new)
+
+        acc = acc * alpha + tl.sum(kn.to(tl.float32) * p[:, None], 0)
+        l_i = l_i * alpha + tl.sum(p, 0)
+        m_i = m_new
+
+    # 3. 尾巴处理 (Epilogue) - 处理剩下的零头 (如果 seq_len 不是 32 的倍数)
+    if limit < seq_len:
+        start_n = limit
+        offs_n = start_n + tl.arange(0, BLOCK_N)
         mask_n = offs_n < seq_len
         
         l_block_id = offs_n // KV_BLOCK_SIZE
@@ -160,6 +224,7 @@ def flash_mla_decode_fused_kernel(
         block_off = offs_n % KV_BLOCK_SIZE
 
         kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
+        
         kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd, mask=mask_n[:, None], other=0.0).to(tl.float16)
         kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd, mask=mask_n[:, None], other=0.0).to(tl.float16)
         
