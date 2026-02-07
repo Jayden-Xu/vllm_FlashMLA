@@ -11,13 +11,12 @@ MODEL_PATH = "deepseek-ai/DeepSeek-V2-Lite-Chat"
 GPU_MEM_UTIL = "0.9"
 ENV_VAR_NAME = "DISABLE_FLASH_MLA" 
 TRITON_CACHE_DIR = os.path.expanduser("~/.triton/cache")
-MAX_MODEL_LEN = 8192 # limit GPU memory
-GPU_COOLDOWN_SECONDS = 5
+MAX_MODEL_LEN = 16384 # limit GPU memory
+GPU_COOLDOWN_SECONDS = 10
 
 DECODE_FOCUSED_CONFIGS = [
-    (512, 512, [1, 16, 32, 64, 128], "Balanced"),
-    (1024, 1024, [1, 16, 32, 64, 128], "Balanced"),
-    (2048, 2048, [1, 16, 32, 64, 128], "Long Decode"),
+    (2048, 1024, [1, 16, 32, 64, 128]),
+    (8192, 1024, [1, 16, 32, 64, 128])
 ]
 
 VERIFY_NUM_TOKENS = 64
@@ -95,7 +94,7 @@ def parse_throughput(output: Optional[str]) -> Tuple[float, str]:
         best_config = f"S1:{s1} | S2:{s2}"
 
     else:
-        best_config = "N/A"
+        best_config = "No AutoTune Config"
     
     # throughput
     val = 0.0
@@ -117,7 +116,7 @@ def main():
         writer = csv.writer(f)
         writer.writerow(["In", "Out", "BS", "Base_TPS", "Ours_TPS", "Speedup", "Config"])
         
-        for in_len, out_len, batch_sizes, desc in DECODE_FOCUSED_CONFIGS:
+        for in_len, out_len, batch_sizes in DECODE_FOCUSED_CONFIGS:
             for bs in batch_sizes:
                 # vLLM baseline
                 out_base = run_vllm_throughput(True, in_len, out_len, bs)
