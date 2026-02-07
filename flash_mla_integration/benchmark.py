@@ -19,7 +19,6 @@ DECODE_FOCUSED_CONFIGS = [
     (4096, 256, [1, 16, 32, 64, 128]),
     (8192, 256, [1, 16, 32, 64, 128]),
     (16384, 256, [1, 16, 32, 64, 128]),
-    (32768, 256, [1, 16, 32, 64, 128]),
 ]
 
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -71,7 +70,7 @@ def run_vllm_throughput(disable_custom: bool, in_len: int, out_len: int, bs: int
 
 def parse_throughput(output: Optional[str]) -> Tuple[float, str]:
     if not output or any(x in output for x in ["ERROR", "CRASH", "out of memory"]): 
-        return 0.0, "Err/OOM"
+        return 0.0, "Err/OOM", "N/A"
     
     mode = "Base"
     if "[FlashMLA]: Fused Path" in output:
