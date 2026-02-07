@@ -128,7 +128,11 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
                 FlashMLAImpl._log_fused_once = False
 
         else:
-            actual_split_size = (max_seq_len + num_splits - 1) // num_splits
+            BLOCK_N = 32 
+            ideal_split_size = (max_seq_len + num_splits - 1) // num_splits
+            actual_split_size = ((ideal_split_size + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
+            num_splits = (max_seq_len + actual_split_size - 1) // actual_split_size
+            num_splits = max(1, num_splits)
             
             mid_o = torch.empty((batch_size, self.num_heads, num_splits, actual_latent_dim), 
                                 dtype=torch.float32, device=device)
