@@ -39,7 +39,6 @@ def main():
         trust_remote_code=True,
         dtype="bfloat16",
         gpu_memory_utilization=0.9,
-        enforce_eager=True,
         disable_log_stats=False 
     )
 
