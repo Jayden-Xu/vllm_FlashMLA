@@ -6,7 +6,7 @@ This fork integrates **FlashMLA**, a customized Triton kernel repository optimiz
 
 ## Benchmark Results
 
-Running on **NVIDIA A100-40GB** with **DeepSeek-V2-Lite-Chat**.
+Running on **NVIDIA A100-40GB** with **DeepSeek-V2-Lite-Chat**, with Cuda Graph enabled.
 
 ![FlashMLA Benchmark](./assets/benchmark_result.png)
 
