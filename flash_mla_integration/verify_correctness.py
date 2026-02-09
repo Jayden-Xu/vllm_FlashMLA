@@ -48,7 +48,6 @@ def run():
             gpu_memory_utilization=0.9,
             trust_remote_code=True,
             dtype="bfloat16",
-            enforce_eager=True,
             disable_log_stats=True
         )
 
