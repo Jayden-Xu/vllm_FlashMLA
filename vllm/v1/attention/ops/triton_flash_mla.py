@@ -1,257 +1,206 @@
+import torch
 import triton
 import triton.language as tl
 
 
-@triton.heuristics({
-    'BLOCK_N': lambda kwargs: 32,
-    'num_warps': lambda kwargs: 4,
-    'num_stages': lambda kwargs: 3,
-})
 @triton.jit
-def flash_mla_decode_stage_1_kernel(
-    Q_nope_ptr, Q_pe_ptr, KV_Cache_ptr, Block_Table_ptr, Seq_Lens_ptr, Mid_O_ptr, Mid_LSE_ptr,
-    stride_qnb, stride_qnh, stride_qnd,
-    stride_qpb, stride_qph, stride_qpd,
-    stride_kvb, stride_kvo, stride_kvd,
+def _flash_mla_stage1(
+    Q, K_Cache, V_Cache, Block_Table, Seq_Lens, Att_Out,
+    # strides
+    stride_qb, stride_qh, stride_qd,
+    stride_kb, stride_ko, stride_kd,
+    stride_vb, stride_vo, stride_vd,
     stride_btb, stride_bts,
-    stride_mid_ob, stride_mid_oh, stride_mid_os, stride_mid_od,
-    stride_mid_lb, stride_mid_lh, stride_mid_ls,
-    sm_scale,
-    SPLIT_SIZE, 
-    KV_BLOCK_SIZE: tl.constexpr,
-    D_LATENT: tl.constexpr,
-    D_ROPE: tl.constexpr,
+    stride_ab, stride_ah, stride_as, stride_ad,
+    # config
+    sm_scale: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    D_NOPE: tl.constexpr,
+    D_PE: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
 ):
+
     pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    pid_s = tl.program_id(2)
+    pid_hg = tl.program_id(1)
+    pid_split = tl.program_id(2)
     
-    offs_d_latent = tl.arange(0, D_LATENT)
-    offs_d_rope = tl.arange(0, D_ROPE)
+    h_start = pid_hg * BLOCK_H
+    h_offs = h_start + tl.arange(0, BLOCK_H)
     
-    # load to 2D to use Tensor Core
-    qn = tl.load(Q_nope_ptr + pid_b * stride_qnb + pid_h * stride_qnh + offs_d_latent * stride_qnd).to(tl.float16)[None, :]
-    qp = tl.load(Q_pe_ptr + pid_b * stride_qpb + pid_h * stride_qph + offs_d_rope * stride_qpd).to(tl.float16)[None, :]
+    seq_len = tl.load(Seq_Lens + pid_b)
 
-    seq_len = tl.load(Seq_Lens_ptr + pid_b)
-    start_n = pid_s * SPLIT_SIZE
-    end_n = tl.minimum(start_n + SPLIT_SIZE, seq_len)
-
-    if start_n >= seq_len:
-        mid_lse_ptr = Mid_LSE_ptr + pid_b * stride_mid_lb + pid_h * stride_mid_lh + pid_s * stride_mid_ls
-        tl.store(mid_lse_ptr, float("-inf"))
-        return
-
-    # use tensor
-    m_i = tl.full([1], float("-inf"), dtype=tl.float32)
-    l_i = tl.full([1], 0.0, dtype=tl.float32)
-    acc = tl.zeros([1, D_LATENT], dtype=tl.float32)
-
-    num_valid_tokens = end_n - start_n
-    num_full_blocks = num_valid_tokens // BLOCK_N
-    limit = start_n + num_full_blocks * BLOCK_N
+    split_size = tl.cdiv(seq_len, NUM_SPLITS)
+    start = pid_split * split_size
+    end = tl.minimum(start + split_size, seq_len)
     
-    bt_ptr_base = Block_Table_ptr + pid_b * stride_btb
-
-    # loop peeling
-    for curr_n in range(start_n, limit, BLOCK_N):
-        offs_n = curr_n + tl.arange(0, BLOCK_N)
+    if end <= start:
+        return  # empty split
+    
+    d_nope = tl.arange(0, D_NOPE)
+    d_pe = D_NOPE + tl.arange(0, D_PE)
+    
+    q_base = Q + pid_b * stride_qb + h_offs[:, None] * stride_qh
+    q_nope = tl.load(q_base + d_nope[None, :] * stride_qd).to(tl.float32)
+    q_pe = tl.load(q_base + d_pe[None, :] * stride_qd).to(tl.float32)
+    
+    m = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
+    l = tl.zeros([BLOCK_H], dtype=tl.float32)
+    acc = tl.zeros([BLOCK_H, D_NOPE], dtype=tl.float32)
+    
+    bt_base = Block_Table + pid_b * stride_btb
+    
+    # loop over blocks
+    for k_start in range(start, end, BLOCK_N):
+        k_offs = k_start + tl.arange(0, BLOCK_N)
+        k_mask = k_offs < end
         
-        l_block_id = offs_n // KV_BLOCK_SIZE
-        p_block_id = tl.load(bt_ptr_base + l_block_id * stride_bts)
-        block_off = offs_n % KV_BLOCK_SIZE
-
-        kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
-        kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd).to(tl.float16)
-        kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd).to(tl.float16)
+        page_ids = tl.load(bt_base + (k_offs // PAGE_SIZE) * stride_bts, mask=k_mask, other=0)
+        page_offs = k_offs % PAGE_SIZE
         
-        # use tl.dot instead of tl.sum
-        qk = (tl.dot(qn, tl.trans(kn)) + tl.dot(qp, tl.trans(kp))) * sm_scale
-
-        m_curr = tl.max(qk, 1)
-        m_new = tl.maximum(m_i, m_curr)
-        p = tl.exp(qk - m_new)
-        alpha = tl.exp(m_i - m_new)
-
-        acc = acc * alpha + tl.dot(p.to(tl.float16), kn)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_new
-
-    # peeling
-    if limit < end_n:
-        curr_n = limit
-        offs_n = curr_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < end_n
+        k_base = K_Cache + page_ids[:, None] * stride_kb + page_offs[:, None] * stride_ko
         
-        l_block_id = offs_n // KV_BLOCK_SIZE
-        p_block_id = tl.load(bt_ptr_base + l_block_id * stride_bts, mask=mask_n, other=0)
-        block_off = offs_n % KV_BLOCK_SIZE
-
-        kv_base = KV_Cache_ptr + p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
-        kn = tl.load(kv_base + offs_d_latent[None, :] * stride_kvd, mask=mask_n[:, None], other=0.0).to(tl.float16)
-        kp = tl.load(kv_base + (D_LATENT + offs_d_rope[None, :]) * stride_kvd, mask=mask_n[:, None], other=0.0).to(tl.float16)
+        k_nope = tl.load(k_base + d_nope[None, :] * stride_kd, mask=k_mask[:, None], other=0.0).to(tl.float32)
+        k_pe = tl.load(k_base + d_pe[None, :] * stride_kd, mask=k_mask[:, None], other=0.0).to(tl.float32)
         
-        qk = (tl.dot(qn, tl.trans(kn)) + tl.dot(qp, tl.trans(kp))) * sm_scale
-        qk = tl.where(mask_n[None, :], qk, float("-inf"))
-
-        m_curr = tl.max(qk, 1)
-        m_new = tl.maximum(m_i, m_curr)
-        p = tl.exp(qk - m_new)
-        alpha = tl.exp(m_i - m_new)
-
-        acc = acc * alpha + tl.dot(p.to(tl.float16), kn)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_new
-
-    inv_l = 1.0 / tl.maximum(l_i, 1e-10)
-    acc_flat = tl.reshape(acc * inv_l, [D_LATENT])
+        qk = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_pe, tl.trans(k_pe))
+        qk = qk * sm_scale
+        qk = tl.where(k_mask[None, :], qk, float("-inf"))
+        
+        # online softmax
+        m_new = tl.maximum(m, tl.max(qk, 1))
+        alpha = tl.exp(m - m_new)
+        p = tl.exp(qk - m_new[:, None])
+        
+        # load V nope
+        v_base = V_Cache + page_ids[:, None] * stride_vb + page_offs[:, None] * stride_vo
+        v = tl.load(v_base + d_nope[None, :] * stride_vd, mask=k_mask[:, None], other=0.0).to(tl.float32)
+        
+        acc = acc * alpha[:, None] + tl.dot(p, v)
+        l = l * alpha + tl.sum(p, 1)
+        m = m_new
     
-    mid_o_ptr = Mid_O_ptr + pid_b * stride_mid_ob + pid_h * stride_mid_oh + pid_s * stride_mid_os + offs_d_latent * stride_mid_od
-    mid_lse_ptr = Mid_LSE_ptr + pid_b * stride_mid_lb + pid_h * stride_mid_lh + pid_s * stride_mid_ls
+    acc = acc / l[:, None]
     
-    tl.store(mid_o_ptr, acc_flat.to(Mid_O_ptr.dtype.element_ty))
-    lse_val = tl.where(l_i > 0, m_i + tl.log(l_i), float("-inf"))
-    tl.store(mid_lse_ptr + tl.zeros([1], dtype=tl.int32), lse_val)
+    out_base = Att_Out + pid_b * stride_ab + h_offs[:, None] * stride_ah + pid_split * stride_as
+    tl.store(out_base + d_nope[None, :] * stride_ad, acc)
+    
+    lse = m + tl.log(l)
+    lse_base = Att_Out + pid_b * stride_ab + h_offs * stride_ah + pid_split * stride_as + D_NOPE * stride_ad
+    tl.store(lse_base, lse)
 
 
-@triton.heuristics({
-    'num_warps': lambda kwargs: 8,
-    'num_stages': lambda kwargs: 2,
-})
 @triton.jit
-def flash_mla_decode_stage_2_kernel(
-    Mid_O_ptr, Mid_LSE_ptr, Output_ptr,
-    stride_mob, stride_moh, stride_mos, stride_mod,
-    stride_mlb, stride_mlh, stride_mls,
+def _flash_mla_stage2(
+    Att_Logits, Output, LSE, Seq_Lens,
+    stride_ab, stride_ah, stride_as, stride_ad,
     stride_ob, stride_oh, stride_od,
-    NUM_SPLITS,
-    D_LATENT: tl.constexpr, 
+    stride_lb, stride_lh,
+    D_NOPE: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    RETURN_LSE: tl.constexpr,
 ):
+
     pid_b = tl.program_id(0)
     pid_h = tl.program_id(1)
     
-    # max split is 128 in backend
-    offs_s = tl.arange(0, 128)
-    mask_s = offs_s < NUM_SPLITS
-    offs_d = tl.arange(0, D_LATENT)
+    seq_len = tl.load(Seq_Lens + pid_b)
+    d_offs = tl.arange(0, D_NOPE)
     
-    lse = tl.load(Mid_LSE_ptr + pid_b * stride_mlb + pid_h * stride_mlh + offs_s * stride_mls, mask=mask_s, other=float("-inf"))
-    m_global = tl.max(lse, 0)
+    m = float("-inf")
+    l = 0.0
+    acc = tl.zeros([D_NOPE], dtype=tl.float32)
     
-    if m_global == float("-inf"):
-        tl.store(Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, 0.0)
-        return
-
-    weights = tl.exp(lse - m_global)
-    weights = tl.where(mask_s & (lse > float("-inf")), weights, 0.0)
-    sum_w = tl.sum(weights, 0)
-    
-    mid_o_ptrs = Mid_O_ptr + pid_b * stride_mob + pid_h * stride_moh + offs_s[:, None] * stride_mos + offs_d[None, :] * stride_mod
-    mid_o = tl.load(mid_o_ptrs, mask=mask_s[:, None], other=0.0)
-    
-    final_o = tl.sum(mid_o * weights[:, None], 0) / (sum_w + 1e-10)
-    tl.store(Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d * stride_od, final_o.to(Output_ptr.dtype.element_ty))
-
-
-@triton.heuristics({
-    'BLOCK_N': lambda kwargs: 32,
-    'num_warps': lambda kwargs: 4,
-    'num_stages': lambda kwargs: 3,
-})
-@triton.jit
-def flash_mla_decode_fused_kernel(
-    Q_nope_ptr, Q_pe_ptr, KV_Cache_ptr, Block_Table_ptr, Seq_Lens_ptr, Output_ptr,
-    stride_qnb, stride_qnh, stride_qnd,
-    stride_qpb, stride_qph, stride_qpd,
-    stride_kvb, stride_kvo, stride_kvd,
-    stride_btb, stride_bts,
-    stride_ob, stride_oh, stride_od,
-    sm_scale,
-    KV_BLOCK_SIZE: tl.constexpr,
-    D_LATENT: tl.constexpr,
-    D_ROPE: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-):
-    pid_b = tl.program_id(0)
-    pid_h = tl.program_id(1)
-    
-    bt_ptr_base = Block_Table_ptr + pid_b * stride_btb
-    qn_ptr = Q_nope_ptr + pid_b * stride_qnb + pid_h * stride_qnh
-    qp_ptr = Q_pe_ptr + pid_b * stride_qpb + pid_h * stride_qph
-    
-    offs_d_latent = tl.arange(0, D_LATENT)
-    offs_d_rope = tl.arange(0, D_ROPE)
-    
-    qn = tl.load(qn_ptr + offs_d_latent * stride_qnd).to(tl.float16)[None, :]
-    qp = tl.load(qp_ptr + offs_d_rope * stride_qpd).to(tl.float16)[None, :]
-
-    seq_len = tl.load(Seq_Lens_ptr + pid_b)
-    
-    # use tensors
-    m_i = tl.full([1], float("-inf"), dtype=tl.float32)
-    l_i = tl.full([1], 0.0, dtype=tl.float32)
-    acc = tl.zeros([1, D_LATENT], dtype=tl.float32)
-
-    full_blocks = (seq_len // BLOCK_N) * BLOCK_N
-
-    # loop peeling
-    for start_n in range(0, full_blocks, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        l_block_id = offs_n // KV_BLOCK_SIZE
-        p_block_id = tl.load(bt_ptr_base + l_block_id * stride_bts)
-        block_off = offs_n % KV_BLOCK_SIZE
-
-        kv_off = p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
-        kn = tl.load(KV_Cache_ptr + kv_off + offs_d_latent[None, :] * stride_kvd).to(tl.float16)
-        kp = tl.load(KV_Cache_ptr + kv_off + (D_LATENT + offs_d_rope[None, :]) * stride_kvd).to(tl.float16)
+    for split in range(NUM_SPLITS):
+        split_size = tl.cdiv(seq_len, NUM_SPLITS)
+        split_start = split * split_size
+        split_end = tl.minimum(split_start + split_size, seq_len)
         
-        qk = (tl.dot(qn, tl.trans(kn)) + tl.dot(qp, tl.trans(kp))) * sm_scale
-        
-        m_curr = tl.max(qk, 1) 
-        m_new = tl.maximum(m_i, m_curr)
-        
-        p = tl.exp(qk - m_new)
-        alpha = tl.exp(m_i - m_new)
-
-        acc = acc * alpha + tl.dot(p.to(tl.float16), kn)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_new
-
-    # peeling
-    if full_blocks < seq_len:
-        start_n = full_blocks
-        offs_n = start_n + tl.arange(0, BLOCK_N)
-        mask_n = offs_n < seq_len # mask
-        
-        l_block_id = offs_n // KV_BLOCK_SIZE
-        p_block_id = tl.load(bt_ptr_base + l_block_id * stride_bts, mask=mask_n, other=0)
-        block_off = offs_n % KV_BLOCK_SIZE
-
-        kv_off = p_block_id[:, None] * stride_kvb + block_off[:, None] * stride_kvo
-        
-        kn = tl.load(KV_Cache_ptr + kv_off + offs_d_latent[None, :] * stride_kvd, 
-                     mask=mask_n[:, None], other=0.0).to(tl.float16)
-        kp = tl.load(KV_Cache_ptr + kv_off + (D_LATENT + offs_d_rope[None, :]) * stride_kvd, 
-                     mask=mask_n[:, None], other=0.0).to(tl.float16)
-        
-        qk = (tl.dot(qn, tl.trans(kn)) + tl.dot(qp, tl.trans(kp))) * sm_scale
-        
-        qk = tl.where(mask_n[None, :], qk, float("-inf"))
-
-        # Online Softmax
-        m_curr = tl.max(qk, 1)
-        m_new = tl.maximum(m_i, m_curr)
-        
-        p = tl.exp(qk - m_new)
-        alpha = tl.exp(m_i - m_new)
-
-        acc = acc * alpha + tl.dot(p.to(tl.float16), kn)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_new
-
-    acc = acc / tl.maximum(l_i, 1e-10)
-    acc_flat = tl.reshape(acc, [D_LATENT])
+        if split_end > split_start:
+            base = Att_Logits + pid_b * stride_ab + pid_h * stride_ah + split * stride_as
+            
+            out = tl.load(base + d_offs * stride_ad)
+            lse = tl.load(base + D_NOPE * stride_ad)
+            
+            m_new = tl.maximum(m, lse)
+            alpha = tl.exp(m - m_new)
+            w = tl.exp(lse - m_new)
+            
+            acc = acc * alpha + out * w
+            l = l * alpha + w
+            m = m_new
     
-    out_ptr = Output_ptr + pid_b * stride_ob + pid_h * stride_oh + offs_d_latent * stride_od
-    tl.store(out_ptr, acc_flat.to(Output_ptr.dtype.element_ty))
+    result = acc / l
+    
+    out_ptr = Output + pid_b * stride_ob + pid_h * stride_oh
+    tl.store(out_ptr + d_offs * stride_od, result.to(Output.dtype.element_ty))
+    
+    if RETURN_LSE:
+        lse_val = m + tl.log(l)
+        tl.store(LSE + pid_b * stride_lb + pid_h * stride_lh, lse_val)
+
+
+def flash_mla_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    sm_scale: float,
+    num_splits: int = 4,
+    return_lse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+
+    B, H, D_total = q.shape
+    page_size = k_cache.shape[1]
+    D_nope = v_cache.shape[-1]
+    D_pe = D_total - D_nope
+    
+    device = q.device
+    dtype = q.dtype
+    
+    att_logits = torch.empty(B, H, num_splits, D_nope + 1, dtype=torch.float32, device=device)
+    output = torch.zeros(B, H, D_nope, dtype=dtype, device=device)
+    lse = torch.zeros(B, H, dtype=torch.float32, device=device) if return_lse else None
+    
+    BLOCK_H = 16
+    BLOCK_N = 32
+
+    
+    num_head_groups = triton.cdiv(H, BLOCK_H)
+    
+    # stage 1
+    grid1 = (B, num_head_groups, num_splits)
+    _flash_mla_stage1[grid1](
+        q, k_cache, v_cache, block_table, seq_lens, att_logits,
+        *q.stride(),
+        *k_cache.stride(),
+        *v_cache.stride(),
+        *block_table.stride(), *att_logits.stride(),
+        sm_scale=sm_scale,
+        PAGE_SIZE=page_size,
+        D_NOPE=D_nope,
+        D_PE=D_pe,
+        BLOCK_N=BLOCK_N,
+        BLOCK_H=BLOCK_H,
+        NUM_SPLITS=num_splits,
+        num_warps=4,
+        num_stages=2,
+    )
+    
+    # stage 2
+    grid2 = (B, H)
+    _flash_mla_stage2[grid2](
+        att_logits, output, lse, seq_lens,
+        *att_logits.stride(), *output.stride(),
+        lse.stride(0) if return_lse else 0,
+        lse.stride(1) if return_lse else 0,
+        D_NOPE=D_nope,
+        NUM_SPLITS=num_splits,
+        RETURN_LSE=return_lse,
+        num_warps=4,
+        num_stages=2,
+    )
+    
+    return output, lse
