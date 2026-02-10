@@ -44,7 +44,7 @@ def run_vllm_throughput(disable_custom: bool, in_len: int, out_len: int, bs: int
     env = os.environ.copy()
     env[ENV_VAR_NAME] = "1" if disable_custom else "0"
     
-    current_out_len = 10 if is_warmup else out_len
+    current_out_len = out_len
     
     cmd = [
         "vllm", "bench", "throughput",
