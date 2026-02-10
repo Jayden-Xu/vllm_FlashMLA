@@ -165,7 +165,7 @@ def flash_mla_decode(
     lse = torch.zeros(B, H, dtype=torch.float32, device=device) if return_lse else None
     
     BLOCK_H = 8
-    BLOCK_N = 32
+    BLOCK_N = 64
 
     
     num_head_groups = triton.cdiv(H, BLOCK_H)
@@ -185,7 +185,7 @@ def flash_mla_decode(
         BLOCK_N=BLOCK_N,
         BLOCK_H=BLOCK_H,
         NUM_SPLITS=num_splits,
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
     )
     
@@ -199,7 +199,7 @@ def flash_mla_decode(
         D_NOPE=D_nope,
         NUM_SPLITS=num_splits,
         RETURN_LSE=return_lse,
-        num_warps=4,
+        num_warps=8,
         num_stages=2,
     )
     
