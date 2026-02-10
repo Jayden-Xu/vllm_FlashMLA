@@ -11,7 +11,7 @@ This fork integrates **[FlashMLA](https://github.com/Jayden-Xu/FlashMLA)**, a sp
 
 ## Benchmark Results
 
-We benchmarked this backend against the official vLLM Triton-MLA baseline on **NVIDIA A100-80GB** using **DeepSeek-V2-Lite-Chat** with **CUDA Graph enabled**.
+We benchmarked this backend against the official vLLM MLA baseline on **NVIDIA A100-80GB** using **DeepSeek-V2-Lite-Chat** with **CUDA Graph enabled**.
 
 ![FlashMLA Decode Throughput](./assets/benchmark_throughput.png)
 
