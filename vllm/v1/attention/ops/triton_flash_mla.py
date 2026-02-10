@@ -164,7 +164,7 @@ def flash_mla_decode(
     output = torch.zeros(B, H, D_nope, dtype=dtype, device=device)
     lse = torch.zeros(B, H, dtype=torch.float32, device=device) if return_lse else None
     
-    BLOCK_H = 16
+    BLOCK_H = 8
     BLOCK_N = 32
 
     
