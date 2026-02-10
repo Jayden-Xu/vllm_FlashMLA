@@ -2,11 +2,11 @@
 
 # vLLM-FlashMLA: High-Performance Integration of [FlashMLA](https://github.com/Jayden-Xu/FlashMLA).
 
-This fork integrates **FlashMLA**, a customized Triton kernel repository optimized for MLA architectures. 
+This fork integrates **[FlashMLA](https://github.com/Jayden-Xu/FlashMLA)**, a customized Triton kernel repository optimized for MLA architectures. 
 
 ## Benchmark Results
 
-Running on **NVIDIA A100-40GB** with **DeepSeek-V2-Lite-Chat**, with Cuda Graph enabled.
+Running on **NVIDIA A100-80GB** with **DeepSeek-V2-Lite-Chat**, with Cuda Graph enabled.
 
 ![FlashMLA Decode Throughput](./assets/benchmark_throughput.png)
 
