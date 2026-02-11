@@ -166,6 +166,8 @@ def flash_mla_decode(
     
     BLOCK_H = 8
     BLOCK_N = 64
+    num_warps = 8
+    num_stages = 2
 
     
     num_head_groups = triton.cdiv(H, BLOCK_H)
@@ -185,8 +187,8 @@ def flash_mla_decode(
         BLOCK_N=BLOCK_N,
         BLOCK_H=BLOCK_H,
         NUM_SPLITS=num_splits,
-        num_warps=8,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     
     # stage 2
@@ -199,8 +201,8 @@ def flash_mla_decode(
         D_NOPE=D_nope,
         NUM_SPLITS=num_splits,
         RETURN_LSE=return_lse,
-        num_warps=8,
-        num_stages=2,
+        num_warps=num_warps,
+        num_stages=num_stages,
     )
     
     return output, lse
