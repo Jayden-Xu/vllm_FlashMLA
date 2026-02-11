@@ -61,13 +61,14 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         self.scale = mla_args.get("scale", 1.0)
         self.qk_rope_dim = mla_args.get("qk_rope_head_dim", 64)
         self.num_heads = mla_args.get("num_heads", 16)
+        self.kv_lora_rank = mla_args.get("kv_lora_rank", 512)
         self.num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
         
         logger.info(f"[FlashMLA] Initialized (Num Heads: {self.num_heads}, Scale: {self.scale}, QK RoPE dim: {self.qk_rope_dim}, Num SMs: {self.num_sms})")
 
     def _get_num_splits(self, batch_size: int) -> int:
 
-        BLOCK_H = 8 
+        BLOCK_H = 16
         heads_per_block = max(1, self.num_heads // BLOCK_H) 
         base_grid = batch_size * heads_per_block
 
