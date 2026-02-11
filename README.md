@@ -17,6 +17,8 @@ We benchmarked this backend against the official vLLM MLA baseline on **NVIDIA A
 
 ![FlashMLA Decode Latency](./assets/benchmark_latency.png)
 
+![FlashMLA Decode Precision](./assets/benchmark_precision.png)
+
 ---
 <p align="center">
   <picture>
