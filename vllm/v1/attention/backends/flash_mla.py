@@ -61,21 +61,41 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         self.scale = mla_args.get("scale", 1.0)
         self.qk_rope_dim = mla_args.get("qk_rope_head_dim", 64)
         self.num_heads = mla_args.get("num_heads", 16)
+        self.num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
         
-        logger.info(f"[FlashMLA] Initialized (Num Heads: {self.num_heads}, Scale: {self.scale}, QK RoPE dim: {self.qk_rope_dim})")
+        logger.info(f"[FlashMLA] Initialized (Num Heads: {self.num_heads}, Scale: {self.scale}, QK RoPE dim: {self.qk_rope_dim}, Num SMs: {self.num_sms})")
 
     def _get_num_splits(self, batch_size: int) -> int:
 
-        base_blocks = batch_size * self.num_heads
+        BLOCK_H = 8 
+        heads_per_block = max(1, self.num_heads // BLOCK_H) 
+        base_grid = batch_size * heads_per_block
 
-        if base_blocks <= 16:
-            return 8
-        elif base_blocks <= 32:
-            return 4 
-        elif base_blocks <= 256:
-            return 2
-        else:
-            return 1
+        if base_grid == 0: return 1
+        
+        candidate_splits = [1, 2, 4, 8, 16, 32, 64]
+        best_split = 1
+        
+        for s in candidate_splits:
+            current_grid = base_grid * s
+            
+            # smallest split to feed SM
+            if current_grid >= self.num_sms:
+                # avoid tail effect
+                waves = current_grid / self.num_sms
+                
+                if waves < 1.5:
+                    # fallback to avoid tail effect
+                    prev_s = s // 2 if s > 1 else 1
+                    if (base_grid * prev_s) > (self.num_sms * 0.5):
+                        return prev_s
+                
+                return s
+            
+            best_split = s
+        
+        return best_split
+
 
     def _forward_decode(self, q, kv_cache, attn_metadata, layer=None):
         decode_meta = attn_metadata.decode
