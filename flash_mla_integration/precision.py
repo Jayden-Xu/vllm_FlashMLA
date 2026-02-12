@@ -100,8 +100,8 @@ def get_case_summary(base_res, ours_res, case_config):
             common = set(b_probs.keys()) & set(o_probs.keys())
             if len(common) >= 2:
                 ids = sorted(common)
-                v1 = np.array([b_probs[k] for k in ids])
-                v2 = np.array([o_probs[k] for k in ids])
+                v1 = np.exp([b_probs[k] for k in ids])
+                v2 = np.exp([o_probs[k] for k in ids])
                 all_sims.append(cosine_similarity(v1, v2))
 
     avg_cosine = np.mean(all_sims) if all_sims else 0.0
