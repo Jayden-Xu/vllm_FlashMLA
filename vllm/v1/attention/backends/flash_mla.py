@@ -69,33 +69,21 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
     def _get_num_splits(self, batch_size: int) -> int:
 
         BLOCK_H = 16
+
         heads_per_block = max(1, self.num_heads // BLOCK_H) 
         base_grid = batch_size * heads_per_block
 
         if base_grid == 0: return 1
         
+        # ensure at least 4 waves
+        target_grid = self.num_sms * 4        
         candidate_splits = [1, 2, 4, 8, 16, 32, 64]
-        best_split = 1
         
         for s in candidate_splits:
-            current_grid = base_grid * s
-            
-            # smallest split to feed SM
-            if current_grid >= self.num_sms:
-                # avoid tail effect
-                waves = current_grid / self.num_sms
-                
-                if waves < 1.5:
-                    # fallback to avoid tail effect
-                    prev_s = s // 2 if s > 1 else 1
-                    if (base_grid * prev_s) > (self.num_sms * 0.5):
-                        return prev_s
-                
+            if base_grid * s >= target_grid:
                 return s
-            
-            best_split = s
         
-        return best_split
+        return 64
 
 
     def _forward_decode(self, q, kv_cache, attn_metadata, layer=None):
