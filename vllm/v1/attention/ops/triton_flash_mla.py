@@ -42,8 +42,8 @@ def _flash_mla_stage1(
     d_pe = D_NOPE + tl.arange(0, D_PE)
     
     q_base = Q + pid_b * stride_qb + h_offs[:, None] * stride_qh
-    q_nope = tl.load(q_base + d_nope[None, :] * stride_qd).to(tl.float32)
-    q_pe = tl.load(q_base + d_pe[None, :] * stride_qd).to(tl.float32)
+    q_nope = tl.load(q_base + d_nope[None, :] * stride_qd)
+    q_pe = tl.load(q_base + d_pe[None, :] * stride_qd)
     
     m = tl.full([BLOCK_H], float("-inf"), dtype=tl.float32)
     l = tl.zeros([BLOCK_H], dtype=tl.float32)
@@ -61,8 +61,8 @@ def _flash_mla_stage1(
         
         k_base = K_Cache + page_ids[:, None] * stride_kb + page_offs[:, None] * stride_ko
         
-        k_nope = tl.load(k_base + d_nope[None, :] * stride_kd, mask=k_mask[:, None], other=0.0).to(tl.float32)
-        k_pe = tl.load(k_base + d_pe[None, :] * stride_kd, mask=k_mask[:, None], other=0.0).to(tl.float32)
+        k_nope = tl.load(k_base + d_nope[None, :] * stride_kd, mask=k_mask[:, None], other=0.0)
+        k_pe = tl.load(k_base + d_pe[None, :] * stride_kd, mask=k_mask[:, None], other=0.0)
         
         qk = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_pe, tl.trans(k_pe))
         qk = qk * sm_scale
@@ -75,9 +75,9 @@ def _flash_mla_stage1(
         
         # load V nope
         v_base = V_Cache + page_ids[:, None] * stride_vb + page_offs[:, None] * stride_vo
-        v = tl.load(v_base + d_nope[None, :] * stride_vd, mask=k_mask[:, None], other=0.0).to(tl.float32)
+        v = tl.load(v_base + d_nope[None, :] * stride_vd, mask=k_mask[:, None], other=0.0)
         
-        acc = acc * alpha[:, None] + tl.dot(p, v)
+        acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         l = l * alpha + tl.sum(p, 1)
         m = m_new
     
@@ -168,7 +168,6 @@ def flash_mla_decode(
     BLOCK_N = 32
     num_warps = 8
     num_stages = 2
-
     
     num_head_groups = triton.cdiv(H, BLOCK_H)
     
