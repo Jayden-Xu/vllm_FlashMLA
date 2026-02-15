@@ -2437,16 +2437,93 @@ def reshape_and_cache_flash(
 
 
 def concat_and_cache_mla(
-    kv_c: torch.Tensor,
+    k_c_normed: torch.Tensor,
     k_pe: torch.Tensor,
     kv_cache: torch.Tensor,
     slot_mapping: torch.Tensor,
     kv_cache_dtype: str,
-    scale: torch.Tensor,
+    scale: float,
 ) -> None:
-    torch.ops._C_cache_ops.concat_and_cache_mla(
-        kv_c, k_pe, kv_cache, slot_mapping, kv_cache_dtype, scale
-    )
+    """
+    Concatenate k_c_normed and k_pe, then write to kv_cache.
+    
+    For MLA architecture:
+    - K cache: [k_c_normed (nope) | k_pe (rope)]
+    - V cache: [k_c_normed (nope)]
+    
+    Supports fp16, bf16, fp8, and int8 KV cache.
+    """
+    # Check if INT8 KV cache
+    is_int8 = kv_cache_dtype.startswith("int8") or kv_cache.dtype == torch.int8
+    
+    if is_int8:
+        # INT8: Use Triton kernel (C++ kernel doesn't support int8 yet)
+        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
+            triton_reshape_and_cache_flash,
+        )
+        
+        # Prepare scale tensor
+        device = kv_cache.device
+        if isinstance(scale, torch.Tensor):
+            scale_tensor = scale
+        else:
+            scale_tensor = torch.tensor([scale], dtype=torch.float32, device=device)
+        
+        # Squeeze k_pe if needed: [batch, 1, dim] -> [batch, dim]
+        if k_pe.ndim == 3:
+            k_pe = k_pe.squeeze(1)
+        
+        # For MLA, we need to write both k_c_normed and k_pe to the same cache
+        # Layout: [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+        # Strategy: Write them separately using the same kernel twice
+        
+        # Get dimensions
+        num_tokens = k_c_normed.shape[0]
+        kv_lora_rank = k_c_normed.shape[1]
+        qk_rope_head_dim = k_pe.shape[1]
+        
+        # MLA stores K and V in interleaved format:
+        # [nope_dim (used by both K and V) | pe_dim (K only)]
+        # We need to write:
+        # 1. k_c_normed to positions [0:kv_lora_rank]
+        # 2. k_pe to positions [kv_lora_rank:kv_lora_rank+qk_rope_head_dim]
+        
+        # Concatenate to form full key
+        k_full = torch.cat([k_c_normed, k_pe], dim=-1)
+        
+        # For triton_reshape_and_cache_flash, we need to provide:
+        # - key: full concatenated key [num_tokens, kv_lora_rank + qk_rope_head_dim]
+        # - value: just the nope part [num_tokens, kv_lora_rank]
+        # - key_cache: full cache [num_blocks, block_size, full_dim]
+        # - value_cache: view into nope part [num_blocks, block_size, kv_lora_rank]
+        
+        # But triton_reshape_and_cache_flash expects separate K and V caches
+        # For MLA, K and V share the same underlying storage
+        # We need to write them with the correct layout
+        
+        # Solution: Use a custom write for MLA INT8
+        # Write to cache using Triton kernel
+        from vllm.model_executor.layers.attention.mla_attention import (
+            _mla_write_int8_to_cache,
+        )
+        
+        _mla_write_int8_to_cache(
+            k_c_normed=k_c_normed,
+            k_pe=k_pe,
+            kv_cache=kv_cache,
+            slot_mapping=slot_mapping,
+            scale_tensor=scale_tensor,
+        )
+    else:
+        # FP16/BF16/FP8: Use C++ kernel
+        torch.ops._C_cache_ops.concat_and_cache_mla(
+            k_c_normed,
+            k_pe,
+            kv_cache,
+            slot_mapping,
+            kv_cache_dtype,
+            scale,
+        )
 
 
 def concat_and_cache_mla_rope_fused(

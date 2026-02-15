@@ -29,6 +29,7 @@ CacheDType = Literal[
     "fp8_e5m2",
     "fp8_inc",
     "fp8_ds_mla",
+    "int8" # FlashMLA
 ]
 MambaDType = Literal["auto", "float32", "float16"]
 MambaCacheMode = Literal["all", "align", "none"]
@@ -215,6 +216,14 @@ class CacheConfig:
         if cache_dtype.startswith("fp8"):
             logger.info(
                 "Using fp8 data type to store kv cache. It reduces the GPU "
+                "memory footprint and boosts the performance. "
+                "Meanwhile, it may cause accuracy drop without a proper "
+                "scaling factor."
+            )
+        # FlashMLA
+        elif cache_dtype.startswith("int8"):
+            logger.info(
+                "[FlashMLA] Using int8 data type to store kv cache. It reduces the GPU "
                 "memory footprint and boosts the performance. "
                 "Meanwhile, it may cause accuracy drop without a proper "
                 "scaling factor."

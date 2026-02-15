@@ -31,6 +31,7 @@ def reshape_and_cache_kernel_flash(
     USE_HEAD_MAJOR_LAYOUT: tl.constexpr,
     # FP8 flags
     FP8_KV_CACHE: tl.constexpr,
+    INT8_KV_CACHE: tl.constexpr, # FlashMLA
     # tune parameters
     TILE_SIZE: tl.constexpr,
 ):
@@ -81,6 +82,12 @@ def reshape_and_cache_kernel_flash(
         # tl.store will do the correct implicit cast to fp8,
         # based on the key_cache_ptr.dtype.element_ty
         key_tile = key_load if key_load.dtype.is_fp8() else key_load / tl.load(k_scale)
+
+    # FlashMLA
+    elif INT8_KV_CACHE:
+        key_tile = key_load / tl.load(k_scale)
+        key_tile = tl.clamp(key_tile, -128.0, 127.0) # avoid overflow
+
     else:
         key_tile = key_load
 
@@ -95,6 +102,12 @@ def reshape_and_cache_kernel_flash(
             # tl.store will do the correct implicit cast to fp8,
             #  based on the value_cache_ptr.dtype.element_ty
             value_tile = value_load / tl.load(v_scale)
+    
+    # FlashMLA
+    elif INT8_KV_CACHE:
+        value_tile = value_load / tl.load(v_scale)
+        value_tile = tl.clamp(value_tile, -128.0, 127.0) # avoid overflow
+
     else:
         value_tile = value_load
 
@@ -145,16 +158,25 @@ def triton_reshape_and_cache_flash(
     block_stride = key_cache.stride()[0]
     page_stride = key_cache.stride()[1]
 
-    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith("fp8"), (
+    # FlashMLA unlock INT8 KV cache
+    assert kv_cache_dtype == "auto" or kv_cache_dtype.startswith(("fp8", "int8")), (
         f"unsupported kv_cache_dtype (str), got {kv_cache_dtype}."
     )
-    kv_cache_torch_dtype = (
-        current_platform.fp8_dtype()
-        if kv_cache_dtype.startswith("fp8")
-        else key_cache.dtype
-    )
+    # kv_cache_torch_dtype = (
+    #     current_platform.fp8_dtype()
+    #     if kv_cache_dtype.startswith("fp8")
+    #     else key_cache.dtype
+    # )
 
-    if key_cache.dtype != kv_cache_torch_dtype and kv_cache_dtype.startswith("fp8"):
+    # add INT8 support on top of vLLM fp8
+    if kv_cache_dtype.startswith("fp8"):
+        kv_cache_torch_dtype = current_platform.fp8_dtype()
+    elif kv_cache_dtype == "int8":
+        kv_cache_torch_dtype = torch.int8
+    else:
+        kv_cache_torch_dtype = key_cache.dtype
+
+    if key_cache.dtype != kv_cache_torch_dtype and kv_cache_dtype.startswith(("fp8", "int8")):
         # to avoid erounous implicit cast in triton kernel (tl.store to uint8)
         # (e.g. explicit cast to fp8e4m3fnuz is not supported in triton 3.4)
         key_cache = key_cache.view(kv_cache_torch_dtype)
@@ -165,6 +187,8 @@ def triton_reshape_and_cache_flash(
     )
 
     FP8_KV_CACHE = kv_cache_dtype.startswith("fp8")
+    INT8_KV_CACHE = kv_cache_dtype.startswith("int8") # FlashMLA
+
     assert (not FP8_KV_CACHE) or kv_cache_torch_dtype in [
         torch.float8_e4m3fn,
         torch.float8_e5m2,
@@ -217,6 +241,7 @@ def triton_reshape_and_cache_flash(
         USE_HEAD_MAJOR_LAYOUT=use_head_major_layout,
         # FP8 flags
         FP8_KV_CACHE=FP8_KV_CACHE,
+        INT8_KV_CACHE=INT8_KV_CACHE, # FlashMLA
         # autotune parameters
         TILE_SIZE=TILE_SIZE,
         num_warps=num_warps,

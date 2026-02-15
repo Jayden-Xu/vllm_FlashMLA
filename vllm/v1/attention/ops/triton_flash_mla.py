@@ -6,6 +6,8 @@ import triton.language as tl
 @triton.jit
 def _flash_mla_stage1(
     Q, K_Cache, V_Cache, Block_Table, Seq_Lens, Att_Out,
+    K_Scale,
+    V_Scale,
     # strides
     stride_qb, stride_qh, stride_qd,
     stride_kb, stride_ko, stride_kd,
@@ -20,6 +22,7 @@ def _flash_mla_stage1(
     BLOCK_N: tl.constexpr,
     BLOCK_H: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
+    USE_INT8: tl.constexpr,
 ):
 
     pid_b = tl.program_id(0)
@@ -40,6 +43,8 @@ def _flash_mla_stage1(
     
     d_nope = tl.arange(0, D_NOPE)
     d_pe = D_NOPE + tl.arange(0, D_PE)
+    k_scale = tl.load(K_Scale)
+    v_scale = tl.load(V_Scale)
     
     q_base = Q + pid_b * stride_qb + h_offs[:, None] * stride_qh
     q_nope = tl.load(q_base + d_nope[None, :] * stride_qd)
@@ -64,6 +69,10 @@ def _flash_mla_stage1(
         k_nope = tl.load(k_base + d_nope[None, :] * stride_kd, mask=k_mask[:, None], other=0.0)
         k_pe = tl.load(k_base + d_pe[None, :] * stride_kd, mask=k_mask[:, None], other=0.0)
         
+        if USE_INT8:
+            k_nope = (k_nope.to(tl.float32) * k_scale).to(q_nope.dtype)
+            k_pe = (k_pe.to(tl.float32) * k_scale).to(q_pe.dtype)
+        
         qk = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_pe, tl.trans(k_pe))
         qk = qk * sm_scale
         qk = tl.where(k_mask[None, :], qk, float("-inf"))
@@ -76,6 +85,9 @@ def _flash_mla_stage1(
         # load V nope
         v_base = V_Cache + page_ids[:, None] * stride_vb + page_offs[:, None] * stride_vo
         v = tl.load(v_base + d_nope[None, :] * stride_vd, mask=k_mask[:, None], other=0.0)
+
+        if USE_INT8:
+            v = (v.to(tl.float32) * v_scale).to(q_nope.dtype)
         
         acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
         l = l * alpha + tl.sum(p, 1)
@@ -150,6 +162,8 @@ def flash_mla_decode(
     sm_scale: float,
     num_splits: int = 4,
     return_lse: bool = False,
+    k_scale_tensor: torch.Tensor | None = None,
+    v_scale_tensor: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
 
     B, H, D_total = q.shape
@@ -163,6 +177,8 @@ def flash_mla_decode(
     att_logits = torch.empty(B, H, num_splits, D_nope + 1, dtype=torch.float32, device=device)
     output = torch.zeros(B, H, D_nope, dtype=dtype, device=device)
     lse = torch.zeros(B, H, dtype=torch.float32, device=device) if return_lse else None
+
+    is_int8 = k_cache.dtype == torch.int8 or k_cache.dtype == torch.uint8
     
     BLOCK_H = 16
     BLOCK_N = 32
@@ -175,6 +191,8 @@ def flash_mla_decode(
     grid1 = (B, num_head_groups, num_splits)
     _flash_mla_stage1[grid1](
         q, k_cache, v_cache, block_table, seq_lens, att_logits,
+        k_scale_tensor,
+        v_scale_tensor,
         *q.stride(),
         *k_cache.stride(),
         *v_cache.stride(),
@@ -186,6 +204,7 @@ def flash_mla_decode(
         BLOCK_N=BLOCK_N,
         BLOCK_H=BLOCK_H,
         NUM_SPLITS=num_splits,
+        USE_INT8=is_int8,
         num_warps=num_warps,
         num_stages=num_stages,
     )

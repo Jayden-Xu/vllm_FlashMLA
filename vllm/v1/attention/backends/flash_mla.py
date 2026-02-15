@@ -17,6 +17,7 @@ from vllm.platforms.interface import DeviceCapability
 from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
 from vllm.v1.kv_cache_interface import AttentionSpec
 
+# 确保导入路径正确
 from vllm.v1.attention.ops.triton_flash_mla import flash_mla_decode
 
 logger = init_logger(__name__)
@@ -63,8 +64,17 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         self.num_heads = mla_args.get("num_heads", 16)
         self.kv_lora_rank = mla_args.get("kv_lora_rank", 512)
         self.num_sms = torch.cuda.get_device_properties("cuda").multi_processor_count
+        self.int8_dtype = torch.int8
         
-        logger.info(f"[FlashMLA] Initialized (Num Heads: {self.num_heads}, Scale: {self.scale}, QK RoPE dim: {self.qk_rope_dim}, Num SMs: {self.num_sms})")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.k_scale_tensor = torch.tensor([1.0], dtype=torch.float32, device=device)
+        self.v_scale_tensor = torch.tensor([1.0], dtype=torch.float32, device=device)
+        
+        logger.info(
+            f"[FlashMLA] Initialized (Num Heads: {self.num_heads}, "
+            f"Scale: {self.scale}, QK RoPE dim: {self.qk_rope_dim}, "
+            f"Num SMs: {self.num_sms})"
+        )
 
     def _get_num_splits(self, batch_size: int) -> int:
 
@@ -106,19 +116,33 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
         
         d_nope = self.kv_lora_rank
         
+        # --- 1. 处理 INT8 ---
+        is_int8 = False
+        if kv_cache.dtype == torch.uint8:
+            is_int8 = True
+            kv_cache = kv_cache.view(torch.int8)
+        elif kv_cache.dtype == torch.int8:
+            is_int8 = True
+        
         if kv_cache.ndim == 4:
             kv_cache = kv_cache.squeeze(2)
         
         k_cache = kv_cache
         v_cache = kv_cache[..., :d_nope]  # v only has nope
         
-        # dynamic split-K
+        if is_int8:
+            self.k_scale_tensor.fill_(1.0 / 127.0)
+            self.v_scale_tensor.fill_(1.0 / 127.0)
+        else:
+            self.k_scale_tensor.fill_(1.0)
+            self.v_scale_tensor.fill_(1.0)
+        
         num_splits = self._get_num_splits(batch_size)
-
-        config_key = (batch_size, num_splits)
+        
+        config_key = (batch_size, num_splits, is_int8)
         if config_key not in FlashMLAImpl._logged_configs:
             logger.info(
-                f"[FlashMLA-Config] NumSplits={num_splits}"
+                f"[FlashMLA-Config] Batch={batch_size}, NumSplits={num_splits}, INT8={is_int8}"
             )
             FlashMLAImpl._logged_configs.add(config_key)
         
@@ -131,6 +155,8 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
             sm_scale=self.scale,
             num_splits=num_splits,
             return_lse=True,
+            k_scale_tensor=self.k_scale_tensor,
+            v_scale_tensor=self.v_scale_tensor,
         )
         
         return output, lse
@@ -138,7 +164,7 @@ class FlashMLAImpl(MLACommonImpl[FlashMLAMetadata]):
 
 class FlashMLABackend(MLACommonBackend):
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16, torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16", "int8"]
 
     @staticmethod
     def get_name() -> str:

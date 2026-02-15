@@ -195,6 +195,8 @@ from typing import ClassVar, Generic, TypeVar
 
 import torch
 from tqdm import tqdm
+import triton
+import triton.language as tl
 
 from vllm import _custom_ops as ops
 from vllm import envs
@@ -320,6 +322,110 @@ class _DecodeConcatQuantFP8(QuantFP8):
     forward_cuda = _make_forward(QuantFP8.forward_cuda)  # type: ignore[arg-type]
     forward_hip = _make_forward(QuantFP8.forward_hip)  # type: ignore[arg-type]
 
+@triton.jit
+def _mla_write_int8_kernel(
+    k_c_normed_ptr,
+    k_pe_ptr,
+    kv_cache_ptr,
+    slot_mapping_ptr,
+    scale_ptr,
+    # Strides
+    stride_kc_n, stride_kc_d,
+    stride_pe_n, stride_pe_d,
+    stride_cache_b, stride_cache_s, stride_cache_d,
+    # Dimensions
+    kv_lora_rank: tl.constexpr,
+    qk_rope_head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Write INT8-quantized MLA KV cache."""
+    token_idx = tl.program_id(0)
+    
+    slot_idx = tl.load(slot_mapping_ptr + token_idx)
+    if slot_idx < 0:
+        return
+    
+    block_idx = slot_idx // block_size
+    slot_offset = slot_idx % block_size
+    
+    scale = tl.load(scale_ptr)
+    
+    cache_base = (
+        kv_cache_ptr 
+        + block_idx * stride_cache_b 
+        + slot_offset * stride_cache_s
+    )
+    
+    # Write k_c_normed (nope part)
+    d_nope_range = tl.arange(0, kv_lora_rank)
+    k_c_normed_data = tl.load(
+        k_c_normed_ptr + token_idx * stride_kc_n + d_nope_range * stride_kc_d
+    )
+    # 🔥 简单量化：除以 scale，然后 clamp
+    k_c_normed_quant = k_c_normed_data / scale
+    k_c_normed_quant = tl.clamp(k_c_normed_quant, -128.0, 127.0)
+    tl.store(
+        cache_base + d_nope_range * stride_cache_d,
+        k_c_normed_quant
+    )
+    
+    # Write k_pe (rope part)
+    d_pe_range = tl.arange(0, qk_rope_head_dim)
+    k_pe_data = tl.load(
+        k_pe_ptr + token_idx * stride_pe_n + d_pe_range * stride_pe_d
+    )
+    # 🔥 简单量化
+    k_pe_quant = k_pe_data / scale
+    k_pe_quant = tl.clamp(k_pe_quant, -128.0, 127.0)
+    tl.store(
+        cache_base + (kv_lora_rank + d_pe_range) * stride_cache_d,
+        k_pe_quant
+    )
+
+
+def _mla_write_int8_to_cache(
+    k_c_normed: torch.Tensor,
+    k_pe: torch.Tensor,
+    kv_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    scale_tensor: torch.Tensor,
+) -> None:
+    """
+    Write INT8-quantized MLA KV cache using Triton.
+    
+    Args:
+        k_c_normed: [num_tokens, kv_lora_rank]
+        k_pe: [num_tokens, qk_rope_head_dim]
+        kv_cache: [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
+        slot_mapping: [num_tokens]
+        scale_tensor: [1] - quantization scale
+    """
+    num_tokens = k_c_normed.shape[0]
+    kv_lora_rank = k_c_normed.shape[1]
+    qk_rope_head_dim = k_pe.shape[1]
+    block_size = kv_cache.shape[1]
+    
+    # View cache as int8 if needed
+    if kv_cache.dtype != torch.int8:
+        kv_cache = kv_cache.view(torch.int8)
+    
+    # Launch kernel: one thread per token
+    grid = (num_tokens,)
+    _mla_write_int8_kernel[grid](
+        k_c_normed,
+        k_pe,
+        kv_cache,
+        slot_mapping,
+        scale_tensor,
+        # Strides
+        k_c_normed.stride(0), k_c_normed.stride(1),
+        k_pe.stride(0), k_pe.stride(1),
+        kv_cache.stride(0), kv_cache.stride(1), kv_cache.stride(2),
+        # Dimensions
+        kv_lora_rank=kv_lora_rank,
+        qk_rope_head_dim=qk_rope_head_dim,
+        block_size=block_size,
+    )
 
 CUDNN_WORKSPACE_SIZE = 12800
 
