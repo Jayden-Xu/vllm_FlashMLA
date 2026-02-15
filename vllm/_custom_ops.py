@@ -2457,10 +2457,6 @@ def concat_and_cache_mla(
     is_int8 = kv_cache_dtype.startswith("int8") or kv_cache.dtype == torch.int8
     
     if is_int8:
-        # INT8: Use Triton kernel (C++ kernel doesn't support int8 yet)
-        from vllm.v1.attention.ops.triton_reshape_and_cache_flash import (
-            triton_reshape_and_cache_flash,
-        )
         
         # Prepare scale tensor
         device = kv_cache.device
@@ -2472,37 +2468,7 @@ def concat_and_cache_mla(
         # Squeeze k_pe if needed: [batch, 1, dim] -> [batch, dim]
         if k_pe.ndim == 3:
             k_pe = k_pe.squeeze(1)
-        
-        # For MLA, we need to write both k_c_normed and k_pe to the same cache
-        # Layout: [num_blocks, block_size, kv_lora_rank + qk_rope_head_dim]
-        # Strategy: Write them separately using the same kernel twice
-        
-        # Get dimensions
-        num_tokens = k_c_normed.shape[0]
-        kv_lora_rank = k_c_normed.shape[1]
-        qk_rope_head_dim = k_pe.shape[1]
-        
-        # MLA stores K and V in interleaved format:
-        # [nope_dim (used by both K and V) | pe_dim (K only)]
-        # We need to write:
-        # 1. k_c_normed to positions [0:kv_lora_rank]
-        # 2. k_pe to positions [kv_lora_rank:kv_lora_rank+qk_rope_head_dim]
-        
-        # Concatenate to form full key
-        k_full = torch.cat([k_c_normed, k_pe], dim=-1)
-        
-        # For triton_reshape_and_cache_flash, we need to provide:
-        # - key: full concatenated key [num_tokens, kv_lora_rank + qk_rope_head_dim]
-        # - value: just the nope part [num_tokens, kv_lora_rank]
-        # - key_cache: full cache [num_blocks, block_size, full_dim]
-        # - value_cache: view into nope part [num_blocks, block_size, kv_lora_rank]
-        
-        # But triton_reshape_and_cache_flash expects separate K and V caches
-        # For MLA, K and V share the same underlying storage
-        # We need to write them with the correct layout
-        
-        # Solution: Use a custom write for MLA INT8
-        # Write to cache using Triton kernel
+ 
         from vllm.model_executor.layers.attention.mla_attention import (
             _mla_write_int8_to_cache,
         )

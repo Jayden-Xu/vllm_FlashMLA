@@ -181,9 +181,9 @@ def flash_mla_decode(
     is_int8 = k_cache.dtype == torch.int8 or k_cache.dtype == torch.uint8
     
     BLOCK_H = 16
-    BLOCK_N = 32
+    BLOCK_N = 64
     num_warps = 8
-    num_stages = 2
+    num_stages = 1
     
     num_head_groups = triton.cdiv(H, BLOCK_H)
     

@@ -13,6 +13,7 @@ GPU_MEM_UTIL = "0.9"
 ENV_VAR_NAME = "DISABLE_FLASH_MLA" 
 TRITON_CACHE_DIR = os.path.expanduser("~/.triton/cache")
 MAX_MODEL_LEN = 9000
+MAX_BATCH_TOKENS = 65536
 GPU_COOLDOWN_SECONDS = 5
 
 # 测试配置: (Input, Output, BatchSizes)
@@ -66,7 +67,8 @@ def run_vllm_throughput(disable_custom: bool, kv_dtype: str, in_len: int, out_le
         "--kv-cache-dtype", kv_dtype, # ✨ 控制 KV 类型 (auto/int8)
         "--gpu-memory-utilization", GPU_MEM_UTIL,
         "--disable-log-stats",
-        "--no-enable-chunked-prefill"
+        "--no-enable-chunked-prefill",
+        "--max-num-batched-tokens", str(MAX_BATCH_TOKENS)
     ]
     
     # 如果你的 checkpoint 里没有 scale，这里可能需要加上 --quantization-param-path
